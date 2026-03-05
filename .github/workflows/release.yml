@@ -41,6 +41,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REGISTRY_PAT }}
         run: |
+          if [ -z "" ]; then
+            echo "REGISTRY_PAT is not set; skipping plugin-registry update."
+            exit 0
+          fi
+
           git clone https://x-access-token:$GH_TOKEN@github.com/diaryx-org/plugin-registry.git /tmp/registry
           cd /tmp/registry
           git config user.name "github-actions[bot]"
