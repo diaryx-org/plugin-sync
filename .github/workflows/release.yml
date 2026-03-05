@@ -43,6 +43,8 @@ jobs:
         run: |
           git clone https://x-access-token:$GH_TOKEN@github.com/diaryx-org/plugin-registry.git /tmp/registry
           cd /tmp/registry
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           PLUGIN_FILE="plugins/diaryx.sync.md"
           VERSION="${{ steps.meta.outputs.version }}"
@@ -61,6 +63,11 @@ jobs:
           text = re.sub(r'published_at: \".*?\"', f'published_at: \"$NOW\"', text, count=1)
           open('$PLUGIN_FILE', 'w').write(text)
           "
+
+          if git diff --quiet -- "$PLUGIN_FILE"; then
+            echo "No registry changes for $PLUGIN_FILE; skipping PR creation."
+            exit 0
+          fi
 
           git checkout -b "release/diaryx.sync-v$VERSION"
           git add "$PLUGIN_FILE"

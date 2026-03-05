@@ -568,12 +568,6 @@ pub fn manifest(_input: String) -> FnResult<String> {
         plugin_command: Some("GetSyncStatus".into()),
     };
 
-    let workspace_provider = UiContribution::WorkspaceProvider {
-        id: "diaryx.sync".into(),
-        label: "Diaryx Sync".into(),
-        icon: Some("cloud".into()),
-    };
-
     let manifest = GuestManifest {
         id: "diaryx.sync".into(),
         name: "Sync".into(),
@@ -592,7 +586,12 @@ pub fn manifest(_input: String) -> FnResult<String> {
             serde_json::to_value(&snapshots_tab).unwrap_or_default(),
             serde_json::to_value(&history_tab).unwrap_or_default(),
             serde_json::to_value(&status_bar_item).unwrap_or_default(),
-            serde_json::to_value(&workspace_provider).unwrap_or_default(),
+            serde_json::json!({
+                "slot": "WorkspaceProvider",
+                "id": "diaryx.sync",
+                "label": "Diaryx Sync",
+                "icon": "cloud",
+            }),
         ],
         commands: all_commands(),
         cli: vec![serde_json::json!({
