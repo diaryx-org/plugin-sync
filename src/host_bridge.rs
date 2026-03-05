@@ -27,6 +27,9 @@ extern "ExtismHost" {
     /// Write a text file to the workspace.
     pub fn host_write_file(input: String) -> String;
 
+    /// Delete a file from the workspace.
+    pub fn host_delete_file(input: String) -> String;
+
     /// Write binary content to a file (base64-encoded input).
     pub fn host_write_binary(input: String) -> String;
 
@@ -88,6 +91,13 @@ pub fn file_exists(path: &str) -> Result<bool, String> {
 pub fn write_file(path: &str, content: &str) -> Result<(), String> {
     let input = serde_json::json!({ "path": path, "content": content }).to_string();
     unsafe { host_write_file(input) }.map_err(|e| format!("host_write_file failed: {e}"))?;
+    Ok(())
+}
+
+/// Delete a workspace file.
+pub fn delete_file(path: &str) -> Result<(), String> {
+    let input = serde_json::json!({ "path": path }).to_string();
+    unsafe { host_delete_file(input) }.map_err(|e| format!("host_delete_file failed: {e}"))?;
     Ok(())
 }
 

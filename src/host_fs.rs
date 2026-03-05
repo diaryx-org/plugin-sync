@@ -49,10 +49,8 @@ impl AsyncFileSystem for HostFs {
 
     fn delete_file<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            // Delete is implemented as writing empty content with a special signal
-            // The host is responsible for actual deletion
             let path_str = path.to_string_lossy();
-            host_bridge::write_file(&path_str, "").map_err(|e| Error::new(ErrorKind::Other, e))
+            host_bridge::delete_file(&path_str).map_err(|e| Error::new(ErrorKind::Other, e))
         })
     }
 
@@ -83,24 +81,59 @@ impl AsyncFileSystem for HostFs {
 
     fn is_dir<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, bool> {
         Box::pin(async move {
-            // Heuristic: if path has no extension, treat as directory
+            let path_str = path.to_string_lossy();
+            let normalized = path_str.trim_end_matches('/');
+            if normalized.is_empty() || normalized == "." {
+                return true;
+            }
+
+            // If path exists and has recursive children, treat as directory.
+            // This works across native/web hosts where list_files is recursive.
+            if host_bridge::file_exists(normalized).unwrap_or(false)
+                && let Ok(entries) = host_bridge::list_files(normalized)
+            {
+                let prefix = format!("{normalized}/");
+                if entries
+                    .iter()
+                    .any(|entry| entry != normalized && entry.starts_with(&prefix))
+                {
+                    return true;
+                }
+            }
+
+            // Fallback heuristic when host can't answer directory-ness directly.
             path.extension().is_none()
         })
     }
 
     fn move_file<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            // Implement as read + write + delete
             let from_str = from.to_string_lossy();
             let to_str = to.to_string_lossy();
+
+            let from_exists =
+                host_bridge::file_exists(&from_str).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            if !from_exists {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("Source file not found: {from_str}"),
+                ));
+            }
+
+            let to_exists =
+                host_bridge::file_exists(&to_str).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            if to_exists {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!("Destination already exists: {to_str}"),
+                ));
+            }
 
             let content =
                 host_bridge::read_file(&from_str).map_err(|e| Error::new(ErrorKind::Other, e))?;
             host_bridge::write_file(&to_str, &content)
                 .map_err(|e| Error::new(ErrorKind::Other, e))?;
-            // Delete original via write_file with empty (host interprets this)
-            let _ = host_bridge::write_file(&from_str, "");
-            Ok(())
+            host_bridge::delete_file(&from_str).map_err(|e| Error::new(ErrorKind::Other, e))
         })
     }
 

@@ -84,6 +84,7 @@ The plugin owns all CRDT state (WorkspaceCrdt, BodyDocManager) in its own WASM s
 | `host_list_files` | List files under a prefix |
 | `host_file_exists` | Check file existence |
 | `host_write_file` | Write a text file |
+| `host_delete_file` | Delete a file |
 | `host_write_binary` | Write a binary file |
 | `host_emit_event` | Emit sync events to host |
 | `host_storage_get` | Load persisted CRDT state |

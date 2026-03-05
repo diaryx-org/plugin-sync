@@ -144,8 +144,9 @@
   }
 
   async function checkStatus() {
-    setStatus('Checking sync status...', false);
-    const result = await sendPluginCommand('GetSyncStatus', {
+    setStatus('Checking provider status...', false);
+    const result = await sendPluginCommand('GetProviderStatus', {
+      provider_id: 'diaryx.sync',
       server_url: serverEl.value.trim() || null,
       auth_token: tokenEl.value.trim() || null,
     });
@@ -153,10 +154,11 @@
       setStatus(result?.error || 'Status check failed', true);
       return;
     }
-    const state = result.data.state || 'idle';
-    const label = result.data.label || state;
-    const detail = result.data.detail ? ` (${result.data.detail})` : '';
-    setStatus(`${label}${detail}`, state === 'error');
+    if (result.data.ready) {
+      setStatus('Ready to sync.', false);
+      return;
+    }
+    setStatus(result.data.message || 'Not ready', true);
   }
 
   async function saveConfig() {

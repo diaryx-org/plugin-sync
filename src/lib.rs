@@ -81,8 +81,11 @@ mod custom_random {
 
 use extism_pdk::*;
 use serde_json::Value as JsonValue;
+use std::io::{Cursor, Read};
+use std::path::{Component, Path, PathBuf};
+use zip::ZipArchive;
 
-use diaryx_core::plugin::{ComponentRef, SidebarSide, StatusBarPosition, UiContribution};
+use diaryx_core::plugin::{ComponentRef, SettingsField, SidebarSide, StatusBarPosition, UiContribution};
 use diaryx_sync::IncomingEvent;
 
 // Re-export the protocol types from diaryx_extism for compatibility
@@ -153,11 +156,19 @@ struct SyncExtismConfig {
 }
 
 fn normalize_server_base(server_url: &str) -> String {
-    server_url
-        .trim_end_matches("/sync2")
-        .trim_end_matches("/sync")
-        .trim_end_matches('/')
-        .to_string()
+    let mut base = server_url.trim().trim_end_matches('/').to_string();
+    loop {
+        if let Some(stripped) = base.strip_suffix("/sync2") {
+            base = stripped.trim_end_matches('/').to_string();
+            continue;
+        }
+        if let Some(stripped) = base.strip_suffix("/sync") {
+            base = stripped.trim_end_matches('/').to_string();
+            continue;
+        }
+        break;
+    }
+    base
 }
 
 fn load_extism_config() -> SyncExtismConfig {
@@ -182,6 +193,55 @@ fn command_param_str(params: &JsonValue, key: &str) -> Option<String> {
 
 fn command_param_bool(params: &JsonValue, key: &str) -> Option<bool> {
     params.get(key).and_then(|v| v.as_bool())
+}
+
+fn apply_config_patch(config: &mut SyncExtismConfig, incoming: &JsonValue) {
+    apply_config_string(config, incoming, "server_url", |cfg, value| {
+        cfg.server_url = value
+    });
+    apply_config_string(config, incoming, "auth_token", |cfg, value| {
+        cfg.auth_token = value
+    });
+    apply_config_string(config, incoming, "workspace_id", |cfg, value| {
+        cfg.workspace_id = value
+    });
+    apply_config_string(config, incoming, "active_join_code", |cfg, value| {
+        cfg.active_join_code = value
+    });
+    apply_config_bool(config, incoming, "share_read_only", |cfg, value| {
+        cfg.share_read_only = value
+    });
+}
+
+fn apply_config_string<F>(config: &mut SyncExtismConfig, incoming: &JsonValue, key: &str, set: F)
+where
+    F: FnOnce(&mut SyncExtismConfig, Option<String>),
+{
+    if let Some(raw) = incoming.get(key) {
+        if raw.is_null() {
+            set(config, None);
+        } else if let Some(value) = raw.as_str() {
+            let normalized = value.trim();
+            if normalized.is_empty() {
+                set(config, None);
+            } else {
+                set(config, Some(normalized.to_string()));
+            }
+        }
+    }
+}
+
+fn apply_config_bool<F>(config: &mut SyncExtismConfig, incoming: &JsonValue, key: &str, set: F)
+where
+    F: FnOnce(&mut SyncExtismConfig, Option<bool>),
+{
+    if let Some(raw) = incoming.get(key) {
+        if raw.is_null() {
+            set(config, None);
+        } else if let Some(value) = raw.as_bool() {
+            set(config, Some(value));
+        }
+    }
 }
 
 fn resolve_server_url(params: &JsonValue, config: &SyncExtismConfig) -> Option<String> {
@@ -255,9 +315,79 @@ fn parse_http_body_json(response: &JsonValue) -> Option<JsonValue> {
     serde_json::from_str(&body).ok()
 }
 
+fn parse_http_body_bytes(response: &JsonValue) -> Result<Vec<u8>, String> {
+    if let Some(body_b64) = response.get("body_base64").and_then(|v| v.as_str()) {
+        if body_b64.is_empty() {
+            return Ok(Vec::new());
+        }
+        use base64::Engine;
+        return base64::engine::general_purpose::STANDARD
+            .decode(body_b64)
+            .map_err(|e| format!("Invalid HTTP response body_base64: {e}"));
+    }
+    Ok(parse_http_body(response).into_bytes())
+}
+
+fn normalize_snapshot_entry_path(path: &str) -> Option<String> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(normalized.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+fn should_skip_snapshot_entry(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        let part = part.to_string_lossy();
+        part.starts_with('.')
+            || part == "__MACOSX"
+            || part == "Thumbs.db"
+            || part == "desktop.ini"
+            || part.starts_with("._")
+    })
+}
+
+fn resolve_workspace_path(workspace_root: Option<&str>, relative_path: &str) -> String {
+    let root = workspace_root.map(str::trim).unwrap_or_default();
+    if root.is_empty() || root == "." {
+        return relative_path.to_string();
+    }
+    let mut full_path = PathBuf::from(root);
+    full_path.push(relative_path);
+    full_path.to_string_lossy().replace('\\', "/")
+}
+
+fn ensure_parent_dirs_for_binary(path: &str) -> Result<(), String> {
+    let Some(parent) = Path::new(path).parent() else {
+        return Ok(());
+    };
+    let parent_str = parent.to_string_lossy();
+    if parent_str.is_empty() || parent_str == "." {
+        return Ok(());
+    }
+    let marker_path = format!(
+        "{}/.diaryx_sync_tmp_parent",
+        parent_str.trim_end_matches('/').trim_end_matches('\\')
+    );
+    host_bridge::write_file(&marker_path, "")?;
+    let _ = host_bridge::delete_file(&marker_path);
+    Ok(())
+}
+
 fn provider_supported(params: &JsonValue) -> bool {
     command_param_str(params, "provider_id")
-        .map(|id| id == "sync")
+        .map(|id| id == "sync" || id == "diaryx.sync")
         .unwrap_or(true)
 }
 
@@ -367,8 +497,82 @@ fn handle_unlink_workspace(_params: &JsonValue) -> JsonValue {
     serde_json::json!({ "ok": true })
 }
 
-fn handle_download_workspace(_params: &JsonValue) -> JsonValue {
-    serde_json::json!({ "files_imported": 0 })
+fn handle_download_workspace(_params: &JsonValue) -> Result<JsonValue, String> {
+    if !provider_supported(_params) {
+        return Err("Unsupported provider".to_string());
+    }
+
+    let config = load_extism_config();
+    let server = resolve_server_url(_params, &config).ok_or("Missing server_url")?;
+    let headers = auth_headers(resolve_auth_token(_params, &config));
+    let remote_id = command_param_str(_params, "remote_id").ok_or("Missing remote_id")?;
+    let workspace_root = command_param_str(_params, "workspace_root");
+    let include_attachments = command_param_bool(_params, "include_attachments").unwrap_or(true);
+    let link_after_import = command_param_bool(_params, "link").unwrap_or(false);
+
+    let response = host_bridge::http_request(
+        "GET",
+        &format!(
+            "{server}/api/workspaces/{remote_id}/snapshot?include_attachments={include_attachments}"
+        ),
+        &headers,
+        None,
+    )?;
+    let status = parse_http_status(&response);
+    if status != 200 {
+        return Err(http_error(status, &parse_http_body(&response)));
+    }
+
+    let snapshot_bytes = parse_http_body_bytes(&response)?;
+    if snapshot_bytes.is_empty() {
+        return Err("Snapshot download returned empty body".to_string());
+    }
+
+    let mut archive = ZipArchive::new(Cursor::new(snapshot_bytes))
+        .map_err(|e| format!("Invalid snapshot zip: {e}"))?;
+
+    let mut files_imported = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("Failed to read zip entry #{index}: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let raw_name = entry.name().to_string();
+        if should_skip_snapshot_entry(&raw_name) {
+            continue;
+        }
+        let Some(relative_path) = normalize_snapshot_entry_path(&raw_name) else {
+            continue;
+        };
+
+        let target_path = resolve_workspace_path(workspace_root.as_deref(), &relative_path);
+        if relative_path.ends_with(".md") {
+            let mut content = String::new();
+            entry
+                .read_to_string(&mut content)
+                .map_err(|e| format!("Failed to read markdown entry {relative_path}: {e}"))?;
+            host_bridge::write_file(&target_path, &content)?;
+        } else {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("Failed to read binary entry {relative_path}: {e}"))?;
+            ensure_parent_dirs_for_binary(&target_path)?;
+            host_bridge::write_binary(&target_path, &bytes)?;
+        }
+        files_imported += 1;
+    }
+
+    if link_after_import {
+        let mut updated = config;
+        updated.workspace_id = Some(remote_id);
+        save_extism_config(&updated);
+    }
+
+    Ok(serde_json::json!({ "files_imported": files_imported }))
 }
 
 fn handle_create_share_session(params: &JsonValue) -> Result<JsonValue, String> {
@@ -525,10 +729,37 @@ pub fn manifest(_input: String) -> FnResult<String> {
         id: "sync-settings".into(),
         label: "Sync".into(),
         icon: None,
-        fields: vec![],
-        component: Some(ComponentRef::Iframe {
-            component_id: "sync.settings".into(),
-        }),
+        fields: vec![
+            SettingsField::AuthStatus {
+                label: "Account".into(),
+                description: Some("Sign in to enable sync.".into()),
+            },
+            SettingsField::UpgradeBanner {
+                feature: "Sync".into(),
+                description: Some("Upgrade to sync workspaces across devices.".into()),
+            },
+            SettingsField::Conditional {
+                condition: "plus".into(),
+                fields: vec![
+                    SettingsField::Section {
+                        label: "Connection".into(),
+                        description: None,
+                    },
+                    SettingsField::Text {
+                        key: "server_url".into(),
+                        label: "Server URL".into(),
+                        description: Some("Automatically configured when you sign in.".into()),
+                        placeholder: Some("https://sync.diaryx.org".into()),
+                    },
+                    SettingsField::Button {
+                        label: "Check Status".into(),
+                        command: "GetProviderStatus".into(),
+                        variant: Some("outline".into()),
+                    },
+                ],
+            },
+        ],
+        component: None,
     };
 
     let share_tab = UiContribution::SidebarTab {
@@ -738,21 +969,7 @@ pub fn handle_command(input: String) -> FnResult<String> {
         )),
         "set_config" => {
             let mut config = load_extism_config();
-            if let Some(server_url) = req.params.get("server_url").and_then(|v| v.as_str()) {
-                config.server_url = Some(server_url.to_string());
-            }
-            if let Some(auth_token) = req.params.get("auth_token").and_then(|v| v.as_str()) {
-                config.auth_token = Some(auth_token.to_string());
-            }
-            if let Some(workspace_id) = req.params.get("workspace_id").and_then(|v| v.as_str()) {
-                config.workspace_id = Some(workspace_id.to_string());
-            }
-            if let Some(join_code) = req.params.get("active_join_code").and_then(|v| v.as_str()) {
-                config.active_join_code = Some(join_code.to_string());
-            }
-            if let Some(read_only) = req.params.get("share_read_only").and_then(|v| v.as_bool()) {
-                config.share_read_only = Some(read_only);
-            }
+            apply_config_patch(&mut config, &req.params);
             save_extism_config(&config);
             Some(Ok(JsonValue::Null))
         }
@@ -761,7 +978,7 @@ pub fn handle_command(input: String) -> FnResult<String> {
         "ListRemoteWorkspaces" => Some(handle_list_remote_workspaces(&req.params)),
         "LinkWorkspace" => Some(handle_link_workspace(&req.params)),
         "UnlinkWorkspace" => Some(Ok(handle_unlink_workspace(&req.params))),
-        "DownloadWorkspace" => Some(Ok(handle_download_workspace(&req.params))),
+        "DownloadWorkspace" => Some(handle_download_workspace(&req.params)),
         "CreateShareSession" => Some(handle_create_share_session(&req.params)),
         "JoinShareSession" => Some(handle_join_share_session(&req.params)),
         "EndShareSession" => Some(handle_end_share_session(&req.params)),
@@ -914,21 +1131,7 @@ pub fn get_config(_input: String) -> FnResult<String> {
 pub fn set_config(input: String) -> FnResult<String> {
     let incoming: JsonValue = serde_json::from_str(&input)?;
     let mut config = load_extism_config();
-    if let Some(server_url) = incoming.get("server_url").and_then(|v| v.as_str()) {
-        config.server_url = Some(server_url.to_string());
-    }
-    if let Some(auth_token) = incoming.get("auth_token").and_then(|v| v.as_str()) {
-        config.auth_token = Some(auth_token.to_string());
-    }
-    if let Some(workspace_id) = incoming.get("workspace_id").and_then(|v| v.as_str()) {
-        config.workspace_id = Some(workspace_id.to_string());
-    }
-    if let Some(join_code) = incoming.get("active_join_code").and_then(|v| v.as_str()) {
-        config.active_join_code = Some(join_code.to_string());
-    }
-    if let Some(read_only) = incoming.get("share_read_only").and_then(|v| v.as_bool()) {
-        config.share_read_only = Some(read_only);
-    }
+    apply_config_patch(&mut config, &incoming);
     save_extism_config(&config);
     Ok(String::new())
 }
