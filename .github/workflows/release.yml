@@ -41,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REGISTRY_PAT }}
         run: |
-          if [ -z "" ]; then
+          if [ -z "$GH_TOKEN" ]; then
             echo "REGISTRY_PAT is not set; skipping plugin-registry update."
             exit 0
           fi
