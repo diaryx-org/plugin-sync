@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  wasm-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Unit tests (compile for wasm)
+        run: cargo test -p diaryx_sync_extism --target wasm32-unknown-unknown --no-run
+
+      - name: Build release wasm
+        run: cargo build -p diaryx_sync_extism --target wasm32-unknown-unknown --release

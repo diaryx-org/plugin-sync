@@ -1,8 +1,8 @@
 ---
 title: "Sync"
-description: "Real-time CRDT sync across devices"
+description: "Real-time multi-device sync across Diaryx workspaces"
 id: "diaryx.sync"
-version: "0.1.0"
+version: "0.1.1"
 author: "Diaryx Team"
 license: "PolyForm Shield 1.0.0"
 repository: "https://github.com/diaryx-org/plugin-sync"
@@ -19,9 +19,6 @@ ui:
     id: sync-settings
     label: "Sync"
   - slot: SidebarTab
-    id: share
-    label: "Share"
-  - slot: SidebarTab
     id: snapshots
     label: "Snapshots"
   - slot: SidebarTab
@@ -36,6 +33,27 @@ ui:
 cli:
   - name: sync
     about: "Sync workspace across devices"
+requested_permissions:
+  defaults:
+    plugin_storage:
+      include: ["all"]
+    http_requests:
+      include: ["all"]
+    read_files:
+      include: ["all"]
+    edit_files:
+      include: ["all"]
+    create_files:
+      include: ["all"]
+    delete_files:
+      include: ["all"]
+  reasons:
+    plugin_storage: "Store sync configuration and CRDT state."
+    http_requests: "Communicate with the configured sync server."
+    read_files: "Read workspace files for snapshotting, reconciliation, and sync."
+    edit_files: "Apply remote changes to existing workspace files."
+    create_files: "Create files received from remote sync or restored from snapshots."
+    delete_files: "Delete files removed by remote sync or snapshot restore operations."
 ---
 
 # diaryx_sync_extism
@@ -48,6 +66,9 @@ This crate compiles to a `.wasm` module that can be loaded by the Extism host ru
 - **Native** (Tauri/CLI): via `diaryx_extism` (wasmtime)
 - **Web**: via `@extism/extism` JS SDK
 
+The Sync settings tab uses Diaryx's declarative plugin UI surfaces.
+Snapshot/history panels remain iframe-backed plugin HTML.
+
 The plugin owns all CRDT state (WorkspaceCrdt, BodyDocManager) in its own WASM sandbox and is loaded on demand when sync is enabled.
 
 ## Exports
@@ -56,7 +77,7 @@ The plugin owns all CRDT state (WorkspaceCrdt, BodyDocManager) in its own WASM s
 
 | Export | Description |
 |--------|-------------|
-| `manifest()` | Plugin metadata + UI contributions (sync settings, Share/Snapshots/History tabs, status bar) |
+| `manifest()` | Plugin metadata + UI contributions (sync settings, Snapshots/History tabs, status bar) |
 | `init(params)` | Initialize with workspace config |
 | `shutdown()` | Persist state and clean up |
 | `handle_command(request)` | Structured commands (CRDT ops, sync state, etc.) |
@@ -90,7 +111,7 @@ The plugin owns all CRDT state (WorkspaceCrdt, BodyDocManager) in its own WASM s
 | `host_storage_get` | Load persisted CRDT state |
 | `host_storage_set` | Persist CRDT state |
 | `host_get_timestamp` | Get current timestamp |
-| `host_ws_request` | Optional forward-compatible websocket bridge (currently host-owned transport path uses stub/no-op) |
+| `host_ws_request` | Generic websocket transport bridge used by the guest's sync runtime |
 
 All host functions use the Extism string ABI (`String -> String`), so side-effect
 functions should still return an empty string (`""`) from the host.

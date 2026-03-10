@@ -5,6 +5,7 @@
 //! these are synchronous calls — the host handles any async work.
 
 use extism_pdk::*;
+use serde::Serialize;
 
 // ============================================================================
 // Host function declarations
@@ -17,6 +18,9 @@ extern "ExtismHost" {
 
     /// Read a file from the workspace as a string.
     pub fn host_read_file(input: String) -> String;
+
+    /// Read a binary file from the workspace (base64-encoded output).
+    pub fn host_read_binary(input: String) -> String;
 
     /// List files recursively under a prefix. Returns JSON array of paths.
     pub fn host_list_files(input: String) -> String;
@@ -50,6 +54,12 @@ extern "ExtismHost" {
 
     /// Perform an HTTP request via the host runtime.
     pub fn host_http_request(input: String) -> String;
+
+    /// Execute a command on another plugin through the host bridge.
+    pub fn host_plugin_command(input: String) -> String;
+
+    /// Read generic runtime context from the host.
+    pub fn host_get_runtime_context(input: String) -> String;
 }
 
 // ============================================================================
@@ -69,6 +79,25 @@ pub fn log_message(level: &str, message: &str) {
 pub fn read_file(path: &str) -> Result<String, String> {
     let input = serde_json::json!({ "path": path }).to_string();
     unsafe { host_read_file(input) }.map_err(|e| format!("host_read_file failed: {e}"))
+}
+
+/// Read a workspace file as binary bytes.
+pub fn read_binary(path: &str) -> Result<Vec<u8>, String> {
+    let input = serde_json::json!({ "path": path }).to_string();
+    let result =
+        unsafe { host_read_binary(input) }.map_err(|e| format!("host_read_binary failed: {e}"))?;
+    if result.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&result)
+        .map_err(|e| format!("Failed to parse binary response: {e}"))?;
+    let data = parsed
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing data in binary response")?;
+    BASE64
+        .decode(data)
+        .map_err(|e| format!("Failed to decode binary response: {e}"))
 }
 
 /// List files recursively under a prefix.
@@ -165,12 +194,107 @@ pub fn get_timestamp() -> Result<u64, String> {
 }
 
 /// Forward-compatible websocket host request bridge.
-///
-/// Current browser/native sync keeps socket ownership in the host transport,
-/// so this may be a no-op until ws handoff mode is enabled.
 pub fn ws_request(payload: &str) -> Result<String, String> {
     unsafe { host_ws_request(payload.to_string()) }
         .map_err(|e| format!("host_ws_request failed: {e}"))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsRequest<'a> {
+    Connect {
+        server_url: &'a str,
+        workspace_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth_token: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_code: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        write_to_disk: Option<bool>,
+    },
+    SendBinary {
+        data: String,
+    },
+    SendText {
+        text: &'a str,
+    },
+    Disconnect,
+}
+
+fn ws_request_json(request: &WsRequest<'_>) -> Result<(), String> {
+    let payload = serde_json::to_string(request)
+        .map_err(|e| format!("Failed to serialize websocket request: {e}"))?;
+    let _ = ws_request(&payload)?;
+    Ok(())
+}
+
+pub fn ws_connect(
+    server_url: &str,
+    workspace_id: &str,
+    auth_token: Option<&str>,
+    session_code: Option<&str>,
+    write_to_disk: Option<bool>,
+) -> Result<(), String> {
+    ws_request_json(&WsRequest::Connect {
+        server_url,
+        workspace_id,
+        auth_token,
+        session_code,
+        write_to_disk,
+    })
+}
+
+pub fn ws_send_binary(data: &[u8]) -> Result<(), String> {
+    ws_request_json(&WsRequest::SendBinary {
+        data: BASE64.encode(data),
+    })
+}
+
+pub fn ws_send_text(text: &str) -> Result<(), String> {
+    ws_request_json(&WsRequest::SendText { text })
+}
+
+pub fn ws_disconnect() -> Result<(), String> {
+    ws_request_json(&WsRequest::Disconnect)
+}
+
+pub fn plugin_command(
+    plugin_id: &str,
+    command: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let input = serde_json::json!({
+        "plugin_id": plugin_id,
+        "command": command,
+        "params": params,
+    })
+    .to_string();
+    let raw = unsafe { host_plugin_command(input) }
+        .map_err(|e| format!("host_plugin_command failed: {e}"))?;
+    let response: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse host_plugin_command response: {e}"))?;
+    if response.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(response
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    } else {
+        Err(response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown plugin command error")
+            .to_string())
+    }
+}
+
+pub fn get_runtime_context() -> Result<serde_json::Value, String> {
+    let raw = unsafe { host_get_runtime_context(String::new()) }
+        .map_err(|e| format!("host_get_runtime_context failed: {e}"))?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse host_get_runtime_context response: {e}"))
 }
 
 /// Perform an HTTP request via the host runtime and parse the JSON response.
@@ -189,6 +313,29 @@ pub fn http_request(
         "method": method,
         "headers": header_map,
         "body": body_json.map(|b| b.to_string()),
+    })
+    .to_string();
+    let raw = unsafe { host_http_request(input) }
+        .map_err(|e| format!("host_http_request failed: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("Failed to parse host_http_request: {e}"))
+}
+
+/// Perform an HTTP request with a raw binary body via the host runtime.
+pub fn http_request_binary(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<serde_json::Value, String> {
+    let header_map: serde_json::Map<String, serde_json::Value> = headers
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    let input = serde_json::json!({
+        "url": url,
+        "method": method,
+        "headers": header_map,
+        "body_base64": BASE64.encode(body),
     })
     .to_string();
     let raw = unsafe { host_http_request(input) }
