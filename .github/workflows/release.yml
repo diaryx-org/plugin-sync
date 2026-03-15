@@ -4,82 +4,11 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Build WASM
-        run: cargo build --target wasm32-unknown-unknown --release
-
-      - name: Compute metadata
-        id: meta
-        run: |
-          WASM="target/wasm32-unknown-unknown/release/diaryx_sync_extism.wasm"
-          SHA=$(sha256sum "$WASM" | cut -d' ' -f1)
-          SIZE=$(stat -c%s "$WASM")
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: target/wasm32-unknown-unknown/release/diaryx_sync_extism.wasm
-          generate_release_notes: true
-
-      - name: Update plugin-registry
-        env:
-          GH_TOKEN: ${{ secrets.REGISTRY_PAT }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "REGISTRY_PAT is not set; skipping plugin-registry update."
-            exit 0
-          fi
-
-          git clone https://x-access-token:$GH_TOKEN@github.com/diaryx-org/plugin-registry.git /tmp/registry
-          cd /tmp/registry
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          PLUGIN_FILE="plugins/diaryx.sync.md"
-          VERSION="${{ steps.meta.outputs.version }}"
-          SHA="${{ steps.meta.outputs.sha256 }}"
-          SIZE="${{ steps.meta.outputs.size }}"
-          URL="https://github.com/diaryx-org/plugin-sync/releases/download/${{ github.ref_name }}/diaryx_sync_extism.wasm"
-          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          python3 -c "
-          import re
-          text = open('$PLUGIN_FILE').read()
-          text = re.sub(r'version: \".*?\"', f'version: \"$VERSION\"', text, count=1)
-          text = re.sub(r'url: \".*?\"', f'url: \"$URL\"', text, count=1)
-          text = re.sub(r'sha256: \".*?\"', f'sha256: \"$SHA\"', text, count=1)
-          text = re.sub(r'size: \d+', f'size: $SIZE', text, count=1)
-          text = re.sub(r'published_at: \".*?\"', f'published_at: \"$NOW\"', text, count=1)
-          open('$PLUGIN_FILE', 'w').write(text)
-          "
-
-          if git diff --quiet -- "$PLUGIN_FILE"; then
-            echo "No registry changes for $PLUGIN_FILE; skipping PR creation."
-            exit 0
-          fi
-
-          git checkout -b "release/diaryx.sync-v$VERSION"
-          git add "$PLUGIN_FILE"
-          git commit -m "release: diaryx.sync v$VERSION"
-          git push origin "release/diaryx.sync-v$VERSION"
-          gh pr create \
-            --repo diaryx-org/plugin-registry \
-            --title "release: diaryx.sync v$VERSION" \
-            --body "Automated release from [plugin-sync v${{ github.ref_name }}](https://github.com/diaryx-org/plugin-sync/releases/tag/${{ github.ref_name }})" \
-            --head "release/diaryx.sync-v$VERSION"
+  release:
+    uses: diaryx-org/.github/.github/workflows/reusable-plugin-release.yml@main
+    with:
+      plugin-id: diaryx.sync
+      crate-name: diaryx_sync_extism
+    secrets:
+      REGISTRY_PAT: ${{ secrets.REGISTRY_PAT }}

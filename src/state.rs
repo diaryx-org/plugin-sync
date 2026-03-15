@@ -14,7 +14,7 @@ use diaryx_sync::{
     UpdateOrigin, format_body_doc_id, format_workspace_doc_id,
 };
 
-use crate::host_bridge;
+use diaryx_plugin_sdk::prelude::*;
 use crate::host_fs::HostFs;
 
 thread_local! {
@@ -32,20 +32,20 @@ fn restore_persisted_body_docs(sync_plugin: &SyncPlugin<HostFs>) {
     for (path, _) in sync_plugin.workspace_crdt().list_active_files() {
         body_doc_names.insert(path);
     }
-    match host_bridge::storage_get(BODY_DOC_MANIFEST_KEY) {
+    match host::storage::get(BODY_DOC_MANIFEST_KEY) {
         Ok(Some(data)) => match serde_json::from_slice::<Vec<String>>(&data) {
             Ok(paths) => {
                 for path in paths {
                     body_doc_names.insert(path);
                 }
             }
-            Err(e) => host_bridge::log_message(
+            Err(e) => host::log::log(
                 "warn",
                 &format!("Failed to decode persisted body doc manifest: {e}"),
             ),
         },
         Ok(None) => {}
-        Err(e) => host_bridge::log_message(
+        Err(e) => host::log::log(
             "warn",
             &format!("Failed to read persisted body doc manifest: {e}"),
         ),
@@ -57,18 +57,18 @@ fn restore_persisted_body_docs(sync_plugin: &SyncPlugin<HostFs>) {
     let body_docs = sync_plugin.body_docs();
     for path in body_doc_names {
         let key = format!("body:{path}");
-        match host_bridge::storage_get(&key) {
+        match host::storage::get(&key) {
             Ok(Some(data)) => {
                 let doc = body_docs.get_or_create(&path);
                 if let Err(e) = doc.apply_update(&data, UpdateOrigin::Remote) {
-                    host_bridge::log_message(
+                    host::log::log(
                         "warn",
                         &format!("Failed to restore persisted body doc {path}: {e}"),
                     );
                 }
             }
             Ok(None) => {}
-            Err(e) => host_bridge::log_message(
+            Err(e) => host::log::log(
                 "warn",
                 &format!("Failed to read persisted body doc {path}: {e}"),
             ),
@@ -83,9 +83,9 @@ pub fn init_state(workspace_id: Option<String>) -> Result<(), &'static str> {
     let mut restored_workspace = false;
 
     // Try to load persisted workspace CRDT state
-    if let Ok(Some(data)) = host_bridge::storage_get("workspace_crdt") {
+    if let Ok(Some(data)) = host::storage::get("workspace_crdt") {
         if let Err(e) = storage.save_doc("workspace", &data) {
-            host_bridge::log_message("warn", &format!("Failed to restore workspace CRDT: {e}"));
+            host::log::log("warn", &format!("Failed to restore workspace CRDT: {e}"));
         } else {
             restored_workspace = true;
         }
@@ -95,7 +95,7 @@ pub fn init_state(workspace_id: Option<String>) -> Result<(), &'static str> {
         match SyncPlugin::load(fs.clone(), Arc::clone(&storage)) {
             Ok(sync_plugin) => sync_plugin,
             Err(e) => {
-                host_bridge::log_message(
+                host::log::log(
                     "warn",
                     &format!("Failed to load persisted sync state, starting fresh: {e}"),
                 );
@@ -218,7 +218,7 @@ pub fn create_session(workspace_id: &str, write_to_disk: bool) -> Result<(), &'s
                     let doc_id = if *is_body {
                         let canonical = normalize_sync_path(doc_name);
                         if canonical.is_empty() {
-                            host_bridge::log_message(
+                            host::log::log(
                                 "warn",
                                 &format!(
                                     "[state] Dropping body sync message with empty canonical path (raw='{}')",
@@ -266,7 +266,7 @@ pub fn enqueue_local_update(doc_id: String, data: Vec<u8>) {
     if doc_id.is_empty() || data.is_empty() {
         return;
     }
-    host_bridge::log_message(
+    host::log::log(
         "debug",
         &format!(
             "[local_update] queued doc_id={} bytes={}",
@@ -295,14 +295,14 @@ pub fn persist_state() -> Result<(), &'static str> {
         // Save workspace CRDT
         let ws_crdt = sync_plugin.workspace_crdt();
         let ws_state = ws_crdt.encode_state_as_update();
-        if let Err(e) = host_bridge::storage_set("workspace_crdt", &ws_state) {
-            host_bridge::log_message("warn", &format!("Failed to persist workspace CRDT: {e}"));
+        if let Err(e) = host::storage::set("workspace_crdt", &ws_state) {
+            host::log::log("warn", &format!("Failed to persist workspace CRDT: {e}"));
         }
 
         // Save all body docs
         let body_docs = sync_plugin.body_docs();
         if let Err(e) = body_docs.save_all() {
-            host_bridge::log_message("warn", &format!("Failed to save body docs: {e}"));
+            host::log::log("warn", &format!("Failed to save body docs: {e}"));
         }
 
         // Persist body docs for all active files plus any still-loaded transient docs.
@@ -321,8 +321,8 @@ pub fn persist_state() -> Result<(), &'static str> {
             if let Some(doc) = body_docs.get(&doc_name) {
                 let doc_state = doc.encode_state_as_update();
                 let key = format!("body:{doc_name}");
-                if let Err(e) = host_bridge::storage_set(&key, &doc_state) {
-                    host_bridge::log_message(
+                if let Err(e) = host::storage::set(&key, &doc_state) {
+                    host::log::log(
                         "warn",
                         &format!("Failed to persist body doc {doc_name}: {e}"),
                     );
@@ -332,8 +332,8 @@ pub fn persist_state() -> Result<(), &'static str> {
 
         let manifest = body_doc_names.into_iter().collect::<Vec<_>>();
         if let Ok(data) = serde_json::to_vec(&manifest) {
-            if let Err(e) = host_bridge::storage_set(BODY_DOC_MANIFEST_KEY, &data) {
-                host_bridge::log_message(
+            if let Err(e) = host::storage::set(BODY_DOC_MANIFEST_KEY, &data) {
+                host::log::log(
                     "warn",
                     &format!("Failed to persist body doc manifest: {e}"),
                 );
@@ -397,14 +397,14 @@ pub fn emit_sync_event(event: &SyncEvent) {
     };
 
     if let Ok(json) = serde_json::to_string(&payload) {
-        let _ = host_bridge::emit_event(&json);
+        let _ = host::events::emit(&json);
     }
 }
 
 /// Shut down the plugin state.
 pub fn shutdown_state() -> Result<(), &'static str> {
     if let Err(e) = persist_state() {
-        host_bridge::log_message(
+        host::log::log(
             "warn",
             &format!("Failed to persist plugin state on shutdown: {e}"),
         );

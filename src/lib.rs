@@ -23,65 +23,17 @@
 //! - `queue_local_update()` — local CRDT change
 
 pub mod binary_protocol;
-pub mod host_bridge;
 pub mod host_fs;
-pub mod state;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_extism_stubs;
+pub mod state;
 
-// Custom getrandom backends for the Extism WASM guest.
-//
-// The default browser backends require wasm-bindgen imports (crypto.getRandomValues)
-// which aren't available in the Extism wasmtime runtime. We provide custom
-// implementations seeded from the host timestamp for both getrandom 0.2 and 0.4.
-mod custom_random {
-    use std::sync::atomic::{AtomicU64, Ordering};
+use diaryx_plugin_sdk::prelude::*;
+diaryx_plugin_sdk::register_getrandom_v02!();
 
-    static RNG_STATE: AtomicU64 = AtomicU64::new(0);
-
-    fn xorshift_fill(buf: &mut [u8]) {
-        let mut state = RNG_STATE.load(Ordering::Relaxed);
-        if state == 0 {
-            state = crate::host_bridge::get_timestamp().unwrap_or(42);
-            if state == 0 {
-                state = 42;
-            }
-        }
-        for byte in buf.iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = state as u8;
-        }
-        RNG_STATE.store(state, Ordering::Relaxed);
-    }
-
-    // getrandom 0.2 custom backend (used by fastrand, futures-lite)
-    fn custom_getrandom_v02(buf: &mut [u8]) -> Result<(), getrandom::Error> {
-        xorshift_fill(buf);
-        Ok(())
-    }
-
-    getrandom::register_custom_getrandom!(custom_getrandom_v02);
-
-    // getrandom 0.3 custom backend (used by uuid/rng-getrandom).
-    // The `getrandom_backend="custom"` cfg (set in .cargo/config.toml) tells
-    // getrandom 0.3 to call this extern function instead of using browser JS APIs.
-    #[unsafe(no_mangle)]
-    unsafe extern "Rust" fn __getrandom_v03_custom(
-        dest: *mut u8,
-        len: usize,
-    ) -> Result<(), getrandom_03::Error> {
-        unsafe {
-            let buf = core::slice::from_raw_parts_mut(dest, len);
-            xorshift_fill(buf);
-        }
-        Ok(())
-    }
-}
-
-use extism_pdk::*;
 use diaryx_core::frontmatter;
+use diaryx_core::types::FileMetadata;
+use extism_pdk::*;
 use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
 use std::io::{Cursor, Read, Write};
@@ -93,45 +45,47 @@ use diaryx_core::plugin::{
 };
 use diaryx_sync::{IncomingEvent, SessionAction};
 
-// Re-export the protocol types from diaryx_extism for compatibility
-// (we define compatible types here since diaryx_extism is a host-side crate)
+// ============================================================================
+// HTTP compat helpers (adapt SDK's typed HttpResponse to old JsonValue API)
+// ============================================================================
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct GuestManifest {
-    id: String,
-    name: String,
-    version: String,
-    description: String,
-    capabilities: Vec<String>,
-    #[serde(default)]
-    ui: Vec<JsonValue>,
-    #[serde(default)]
-    commands: Vec<String>,
-    #[serde(default)]
-    cli: Vec<JsonValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    requested_permissions: Option<JsonValue>,
+fn http_request_compat(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body_json: Option<JsonValue>,
+) -> Result<JsonValue, String> {
+    let header_map: std::collections::HashMap<String, String> =
+        headers.iter().cloned().collect();
+    let body_str = body_json.map(|b| b.to_string());
+    let resp = host::http::request(method, url, &header_map, body_str.as_deref())?;
+    let mut result = serde_json::json!({
+        "status": resp.status,
+        "body": resp.body,
+    });
+    if let Some(b64) = &resp.body_base64 {
+        result["body_base64"] = JsonValue::String(b64.clone());
+    }
+    Ok(result)
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct GuestEvent {
-    event_type: String,
-    payload: JsonValue,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommandRequest {
-    command: String,
-    params: JsonValue,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommandResponse {
-    success: bool,
-    #[serde(default)]
-    data: Option<JsonValue>,
-    #[serde(default)]
-    error: Option<String>,
+fn http_request_binary_compat(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<JsonValue, String> {
+    let header_map: std::collections::HashMap<String, String> =
+        headers.iter().cloned().collect();
+    let resp = host::http::request_binary(method, url, &header_map, body)?;
+    let mut result = serde_json::json!({
+        "status": resp.status,
+        "body": resp.body,
+    });
+    if let Some(b64) = &resp.body_base64 {
+        result["body_base64"] = JsonValue::String(b64.clone());
+    }
+    Ok(result)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -175,7 +129,7 @@ fn normalize_server_base(server_url: &str) -> String {
 }
 
 fn load_extism_config() -> SyncExtismConfig {
-    match host_bridge::storage_get("sync.extism.config") {
+    match host::storage::get("sync.extism.config") {
         Ok(Some(bytes)) => serde_json::from_slice::<SyncExtismConfig>(&bytes).unwrap_or_default(),
         _ => SyncExtismConfig::default(),
     }
@@ -183,7 +137,7 @@ fn load_extism_config() -> SyncExtismConfig {
 
 fn save_extism_config(config: &SyncExtismConfig) {
     if let Ok(bytes) = serde_json::to_vec(config) {
-        let _ = host_bridge::storage_set("sync.extism.config", &bytes);
+        let _ = host::storage::set("sync.extism.config", &bytes);
     }
 }
 
@@ -228,147 +182,59 @@ where
     }
 }
 
-fn runtime_context() -> JsonValue {
-    host_bridge::get_runtime_context().unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[runtime_context] {e}"));
-        serde_json::json!({})
-    })
-}
-
-fn runtime_context_server_url(runtime: &JsonValue) -> Option<String> {
-    runtime
-        .get("server_url")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| normalize_server_base(value))
-}
-
-fn runtime_context_auth_token(runtime: &JsonValue) -> Option<String> {
-    runtime
-        .get("auth_token")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-}
-
-fn runtime_context_workspace_id(runtime: &JsonValue, provider_id: Option<&str>) -> Option<String> {
-    let current_workspace = runtime.get("current_workspace")?;
-
-    if let Some(provider_id) = provider_id {
-        if let Some(provider_links) = current_workspace
-            .get("provider_links")
-            .and_then(|v| v.as_array())
-        {
-            for link in provider_links {
-                if link.get("plugin_id").and_then(|v| v.as_str()) == Some(provider_id)
-                    && let Some(remote_workspace_id) = link
-                        .get("remote_workspace_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                {
-                    return Some(remote_workspace_id.to_string());
-                }
-            }
-        }
-
-        if let Some(plugin_metadata) = current_workspace
-            .get("plugin_metadata")
-            .and_then(|v| v.as_object())
-            && let Some(metadata) = plugin_metadata
-                .get(provider_id)
-                .and_then(|v| v.as_object())
-        {
-            if let Some(remote_workspace_id) = metadata
-                .get("remoteWorkspaceId")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return Some(remote_workspace_id.to_string());
-            }
-
-            if let Some(server_id) = metadata
-                .get("serverId")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return Some(server_id.to_string());
-            }
-        }
-    }
-
-    current_workspace
-        .get("remote_workspace_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-}
-
 fn resolve_server_url(params: &JsonValue, config: &SyncExtismConfig) -> Option<String> {
-    let runtime = runtime_context();
     command_param_str(params, "server_url")
-        .or_else(|| runtime_context_server_url(&runtime))
         .or_else(|| config.server_url.clone())
+        .or_else(|| runtime_context_string("server_url"))
         .map(|s| normalize_server_base(&s))
 }
 
 fn resolve_auth_token(params: &JsonValue, config: &SyncExtismConfig) -> Option<String> {
-    let runtime = runtime_context();
     command_param_str(params, "auth_token")
-        .or_else(|| runtime_context_auth_token(&runtime))
         .or_else(|| config.auth_token.clone())
+        .or_else(|| runtime_context_string("auth_token"))
 }
 
-fn resolve_workspace_id(
-    params: &JsonValue,
-    config: &SyncExtismConfig,
-    provider_id: Option<&str>,
-) -> Option<String> {
-    let runtime = runtime_context();
-    command_param_str(params, "workspace_id")
-        .or_else(|| runtime_context_workspace_id(&runtime, provider_id))
-        .or_else(|| config.workspace_id.clone())
-        .map(|value| value.trim().to_string())
+fn runtime_context_string(key: &str) -> Option<String> {
+    host::context::get()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .map(str::to_string)
+        })
         .filter(|value| !value.is_empty())
 }
 
-fn sync_transport_connect_if_ready(config: &SyncExtismConfig, write_to_disk: Option<bool>) -> Result<(), String> {
-    let runtime = runtime_context();
-
-    let Some(server_url) = runtime_context_server_url(&runtime)
-        .or_else(|| config.server_url.as_deref().map(normalize_server_base))
-    else {
-        host_bridge::ws_disconnect()?;
+fn sync_transport_connect_if_ready(
+    config: &SyncExtismConfig,
+    write_to_disk: Option<bool>,
+) -> Result<(), String> {
+    let Some(server_url) = resolve_server_url(&JsonValue::Null, config) else {
+        host::ws::disconnect()?;
         return Ok(());
     };
-
-    let Some(workspace_id) = runtime_context_workspace_id(&runtime, Some("diaryx.sync"))
-        .or_else(|| config.workspace_id.clone())
-    else {
-        host_bridge::ws_disconnect()?;
+    let Some(workspace_id) = config.workspace_id.as_deref() else {
+        host::ws::disconnect()?;
         return Ok(());
     };
     if workspace_id.trim().is_empty() {
-        host_bridge::ws_disconnect()?;
+        host::ws::disconnect()?;
         return Ok(());
     }
 
-    let auth_token = runtime_context_auth_token(&runtime)
-        .or_else(|| config.auth_token.clone())
-        .filter(|token| !token.trim().is_empty());
+    let auth_token =
+        resolve_auth_token(&JsonValue::Null, config).filter(|token| !token.trim().is_empty());
     if auth_token.is_none() {
-        host_bridge::ws_disconnect()?;
+        host::ws::disconnect()?;
         return Ok(());
     }
 
-    host_bridge::ws_connect(
+    host::ws::connect(
         &server_url,
-        &workspace_id,
+        workspace_id,
         auth_token.as_deref(),
         None,
         write_to_disk,
@@ -379,8 +245,20 @@ fn reconcile_sync_transport(write_to_disk: Option<bool>) {
     let config = load_extism_config();
     let resolved_write_to_disk = write_to_disk.or_else(|| state::get_write_to_disk().ok());
     if let Err(e) = sync_transport_connect_if_ready(&config, resolved_write_to_disk) {
-        host_bridge::log_message("warn", &format!("[sync_transport] {e}"));
+        host::log::log("warn", &format!("[sync_transport] {e}"));
     }
+}
+
+fn with_session_actions<F>(label: &str, f: F) -> Vec<SessionAction>
+where
+    F: FnOnce(&mut diaryx_sync::SyncSession<crate::host_fs::HostFs>) -> Vec<SessionAction>,
+{
+    state::with_session_mut(f)
+        .map(|actions| actions.unwrap_or_default())
+        .unwrap_or_else(|e| {
+            host::log::log("warn", &format!("[{label}] {e}"));
+            vec![]
+        })
 }
 
 fn execute_session_actions(actions: Vec<SessionAction>) {
@@ -390,36 +268,36 @@ fn execute_session_actions(actions: Vec<SessionAction>) {
         while let Some(action) = queue.pop_front() {
             match action {
                 SessionAction::SendBinary(data) => {
-                    if let Err(e) = host_bridge::ws_send_binary(&data) {
-                        host_bridge::log_message("warn", &format!("[sync_transport:send_binary] {e}"));
+                    if let Err(e) = host::ws::send_binary(&data) {
+                        host::log::log(
+                            "warn",
+                            &format!("[sync_transport:send_binary] {e}"),
+                        );
                     }
                 }
                 SessionAction::SendText(text) => {
-                    if let Err(e) = host_bridge::ws_send_text(&text) {
-                        host_bridge::log_message("warn", &format!("[sync_transport:send_text] {e}"));
+                    if let Err(e) = host::ws::send_text(&text) {
+                        host::log::log(
+                            "warn",
+                            &format!("[sync_transport:send_text] {e}"),
+                        );
                     }
                 }
                 SessionAction::Emit(event) => state::emit_sync_event(&event),
                 SessionAction::DownloadSnapshot { workspace_id } => {
-                    let follow_up = handle_download_workspace(&serde_json::json!({
+                    let follow_up = match handle_download_workspace(&serde_json::json!({
                         "remote_id": workspace_id,
                         "include_attachments": true,
                         "link": false,
-                    }))
-                    .map(|_| {
-                        state::with_session_mut(|session| {
+                    })) {
+                        Ok(_) => with_session_actions("snapshot_imported", |session| {
                             poll_future(session.process(IncomingEvent::SnapshotImported))
-                        })
-                        .map(|actions| actions.unwrap_or_default())
-                    })
-                    .unwrap_or_else(|e| {
-                        host_bridge::log_message("warn", &format!("[snapshot_download] {e}"));
-                        Ok(Vec::new())
-                    })
-                    .unwrap_or_else(|e| {
-                        host_bridge::log_message("warn", &format!("[snapshot_imported] {e}"));
-                        Vec::new()
-                    });
+                        }),
+                        Err(e) => {
+                            host::log::log("warn", &format!("[snapshot_download] {e}"));
+                            vec![]
+                        }
+                    };
                     queue.extend(follow_up);
                 }
             }
@@ -430,21 +308,14 @@ fn execute_session_actions(actions: Vec<SessionAction>) {
             break;
         }
 
-        let follow_up = state::with_session_mut(|session| {
+        let follow_up = with_session_actions("local_update", |session| {
             let mut actions = Vec::new();
             for (doc_id, data) in local_updates {
-                let result = poll_future(session.process(IncomingEvent::LocalUpdate {
-                    doc_id,
-                    data,
-                }));
-                actions.extend(result);
+                actions.extend(poll_future(
+                    session.process(IncomingEvent::LocalUpdate { doc_id, data }),
+                ));
             }
             actions
-        })
-        .map(|actions| actions.unwrap_or_default())
-        .unwrap_or_else(|e| {
-            host_bridge::log_message("warn", &format!("[local_update] {e}"));
-            Vec::new()
         });
         queue.extend(follow_up);
     }
@@ -459,9 +330,15 @@ fn http_error(status: u64, body: &str) -> String {
 }
 
 fn sync_status_from_state() -> JsonValue {
-    let (state, label) = match state::has_session() {
-        Ok(true) => ("syncing", "Syncing"),
-        Ok(false) | Err(_) => ("idle", "Idle"),
+    let config = load_extism_config();
+    let has_linked_workspace = config
+        .workspace_id
+        .as_deref()
+        .map(|workspace_id| !workspace_id.trim().is_empty())
+        .unwrap_or(false);
+    let (state, label) = match (has_linked_workspace, state::has_session()) {
+        (true, Ok(true)) => ("syncing", "Syncing"),
+        _ => ("idle", "Idle"),
     };
     serde_json::json!({
         "state": state,
@@ -554,15 +431,114 @@ fn should_skip_snapshot_entry(path: &str) -> bool {
 
 /// Soft-delete a file in the workspace CRDT without using `mark_deleted()`,
 /// which calls `chrono::Utc::now()` and panics in the Extism WASM sandbox.
-fn soft_delete_file(ws: &diaryx_sync::WorkspaceCrdt, path: &str) {
+fn soft_delete_file(ws: &diaryx_sync::WorkspaceCrdt, path: &str) -> bool {
     if let Some(mut meta) = ws.get_file(path) {
+        if meta.deleted {
+            return false;
+        }
         meta.deleted = true;
-        // Use host timestamp instead of chrono::Utc::now()
-        meta.modified_at = host_bridge::get_timestamp()
-            .map(|t| t as i64)
+        meta.modified_at = host::time::timestamp_millis()
+            .map(|timestamp| timestamp as i64)
             .unwrap_or(meta.modified_at + 1);
         let _ = ws.set_file(path, meta);
+        return true;
     }
+    false
+}
+
+fn workspace_relative_path_for_sync(
+    sync_plugin: &diaryx_sync::SyncPlugin<crate::host_fs::HostFs>,
+    path: &str,
+) -> String {
+    let workspace_root = sync_plugin.sync_handler().get_workspace_root();
+    relative_snapshot_path(workspace_root.as_ref().and_then(|root| root.to_str()), path)
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn parse_workspace_metadata_from_markdown(
+    sync_plugin: &diaryx_sync::SyncPlugin<crate::host_fs::HostFs>,
+    path: &str,
+    content: &str,
+) -> Option<(String, FileMetadata)> {
+    let relative_path = workspace_relative_path_for_sync(sync_plugin, path);
+    diaryx_sync::materialize::parse_snapshot_markdown(&relative_path, content)
+        .ok()
+        .map(|(metadata, _)| (relative_path, metadata))
+}
+
+fn apply_workspace_metadata(
+    sync_plugin: &diaryx_sync::SyncPlugin<crate::host_fs::HostFs>,
+    relative_path: &str,
+    metadata: &FileMetadata,
+) -> bool {
+    sync_plugin
+        .sync_manager()
+        .track_metadata(relative_path, metadata);
+
+    let workspace = sync_plugin.workspace_crdt();
+    let metadata_changed = workspace
+        .get_file(relative_path)
+        .map(|current| !current.is_content_equal(metadata))
+        .unwrap_or(true);
+
+    if metadata_changed {
+        let _ = workspace.set_file(relative_path, metadata.clone());
+        return true;
+    }
+
+    false
+}
+
+fn flush_workspace_metadata_changes(sync_plugin: &diaryx_sync::SyncPlugin<crate::host_fs::HostFs>) {
+    sync_plugin.sync_manager().rebuild_uuid_maps();
+    let _ = sync_plugin.sync_manager().emit_workspace_update();
+}
+
+fn refresh_workspace_metadata_from_disk(
+    sync_plugin: &diaryx_sync::SyncPlugin<crate::host_fs::HostFs>,
+    relative_path: &str,
+) -> bool {
+    let workspace_root = sync_plugin.sync_handler().get_workspace_root();
+    let host_path = resolve_workspace_path(
+        workspace_root.as_ref().and_then(|root| root.to_str()),
+        relative_path,
+    );
+    match host::fs::read_file(&host_path) {
+        Ok(content) => parse_workspace_metadata_from_markdown(sync_plugin, &host_path, &content)
+            .map(|(relative_path, metadata)| {
+                apply_workspace_metadata(sync_plugin, &relative_path, &metadata)
+            })
+            .unwrap_or(false),
+        Err(e) => {
+            host::log::log(
+                "warn",
+                &format!(
+                    "[refresh_workspace_metadata_from_disk] read_file FAILED for {}: {}",
+                    host_path, e
+                ),
+            );
+            false
+        }
+    }
+}
+
+fn refresh_related_parent_indexes(
+    sync_plugin: &diaryx_sync::SyncPlugin<crate::host_fs::HostFs>,
+    parent_paths: &[Option<String>],
+) -> bool {
+    let mut changed = false;
+    let mut visited = Vec::new();
+
+    for parent_path in parent_paths.iter().flatten() {
+        let trimmed = parent_path.trim();
+        if trimmed.is_empty() || visited.iter().any(|seen| seen == trimmed) {
+            continue;
+        }
+        visited.push(trimmed.to_string());
+        changed |= refresh_workspace_metadata_from_disk(sync_plugin, trimmed);
+    }
+
+    changed
 }
 
 fn resolve_workspace_path(workspace_root: Option<&str>, relative_path: &str) -> String {
@@ -587,8 +563,8 @@ fn ensure_parent_dirs_for_binary(path: &str) -> Result<(), String> {
         "{}/.diaryx_sync_tmp_parent",
         parent_str.trim_end_matches('/').trim_end_matches('\\')
     );
-    host_bridge::write_file(&marker_path, "")?;
-    let _ = host_bridge::delete_file(&marker_path);
+    host::fs::write_file(&marker_path, "")?;
+    let _ = host::fs::delete_file(&marker_path);
     Ok(())
 }
 
@@ -629,7 +605,7 @@ fn build_workspace_snapshot_zip(
         .map(str::trim)
         .filter(|root| !root.is_empty())
         .unwrap_or(".");
-    let mut files = host_bridge::list_files(prefix)?;
+    let mut files = host::fs::list_files(prefix)?;
     files.sort();
 
     let cursor = Cursor::new(Vec::<u8>::new());
@@ -646,7 +622,7 @@ fn build_workspace_snapshot_zip(
         }
 
         if relative_path.ends_with(".md") {
-            let content = host_bridge::read_file(&file_path)?;
+            let content = host::fs::read_file(&file_path)?;
             zip.start_file(relative_path, options)
                 .map_err(|e| format!("Failed to add markdown entry to zip: {e}"))?;
             zip.write_all(content.as_bytes())
@@ -656,7 +632,7 @@ fn build_workspace_snapshot_zip(
         }
 
         if include_attachments {
-            let bytes = host_bridge::read_binary(&file_path)?;
+            let bytes = host::fs::read_binary(&file_path)?;
             zip.start_file(relative_path, options)
                 .map_err(|e| format!("Failed to add binary entry to zip: {e}"))?;
             zip.write_all(&bytes)
@@ -685,7 +661,7 @@ fn upload_workspace_snapshot(
 
     let (snapshot_zip, files_added) =
         build_workspace_snapshot_zip(workspace_root, include_attachments)?;
-    let response = host_bridge::http_request_binary(
+    let response = http_request_binary_compat(
         "POST",
         &format!(
             "{server}/api/workspaces/{remote_id}/snapshot?mode={mode}&include_attachments={include_attachments}"
@@ -750,7 +726,7 @@ fn handle_list_remote_workspaces(params: &JsonValue) -> Result<JsonValue, String
     let server = resolve_server_url(params, &config).ok_or("Missing server_url")?;
     let headers = auth_headers(resolve_auth_token(params, &config));
     let response =
-        host_bridge::http_request("GET", &format!("{server}/api/workspaces"), &headers, None)?;
+        http_request_compat("GET", &format!("{server}/api/workspaces"), &headers, None)?;
     let status = parse_http_status(&response);
     if status != 200 {
         return Err(http_error(status, &parse_http_body(&response)));
@@ -784,7 +760,7 @@ fn handle_link_workspace(params: &JsonValue) -> Result<JsonValue, String> {
         let server = resolve_server_url(params, &config).ok_or("Missing server_url")?;
         let headers = auth_headers(resolve_auth_token(params, &config));
         let name = command_param_str(params, "name").ok_or("Missing name")?;
-        let response = host_bridge::http_request(
+        let response = http_request_compat(
             "POST",
             &format!("{server}/api/workspaces"),
             &headers,
@@ -839,9 +815,8 @@ fn handle_upload_workspace_snapshot(params: &JsonValue) -> Result<JsonValue, Str
     }
 
     let config = load_extism_config();
-    let provider_id = command_param_str(params, "provider_id");
     let remote_id = command_param_str(params, "remote_id")
-        .or_else(|| resolve_workspace_id(params, &config, provider_id.as_deref()))
+        .or_else(|| config.workspace_id.clone())
         .ok_or("Missing remote_id")?;
     let workspace_root = command_param_str(params, "workspace_root");
     let mode = command_param_str(params, "mode").unwrap_or_else(|| "replace".to_string());
@@ -868,17 +843,14 @@ fn handle_download_workspace(_params: &JsonValue) -> Result<JsonValue, String> {
     }
 
     let config = load_extism_config();
-    let provider_id = command_param_str(_params, "provider_id");
     let server = resolve_server_url(_params, &config).ok_or("Missing server_url")?;
     let headers = auth_headers(resolve_auth_token(_params, &config));
-    let remote_id = command_param_str(_params, "remote_id")
-        .or_else(|| resolve_workspace_id(_params, &config, provider_id.as_deref()))
-        .ok_or("Missing remote_id")?;
+    let remote_id = command_param_str(_params, "remote_id").ok_or("Missing remote_id")?;
     let workspace_root = command_param_str(_params, "workspace_root");
     let include_attachments = command_param_bool(_params, "include_attachments").unwrap_or(true);
     let link_after_import = command_param_bool(_params, "link").unwrap_or(false);
 
-    let response = host_bridge::http_request(
+    let response = http_request_compat(
         "GET",
         &format!(
             "{server}/api/workspaces/{remote_id}/snapshot?include_attachments={include_attachments}"
@@ -922,14 +894,14 @@ fn handle_download_workspace(_params: &JsonValue) -> Result<JsonValue, String> {
             entry
                 .read_to_string(&mut content)
                 .map_err(|e| format!("Failed to read markdown entry {relative_path}: {e}"))?;
-            host_bridge::write_file(&target_path, &content)?;
+            host::fs::write_file(&target_path, &content)?;
         } else {
             let mut bytes = Vec::new();
             entry
                 .read_to_end(&mut bytes)
                 .map_err(|e| format!("Failed to read binary entry {relative_path}: {e}"))?;
             ensure_parent_dirs_for_binary(&target_path)?;
-            host_bridge::write_binary(&target_path, &bytes)?;
+            host::fs::write_binary(&target_path, &bytes)?;
         }
         files_imported += 1;
     }
@@ -948,8 +920,9 @@ fn resolve_runtime_workspace_id(
     params: &JsonValue,
     config: &SyncExtismConfig,
 ) -> Result<String, String> {
-    let provider_id = command_param_str(params, "provider_id");
-    resolve_workspace_id(params, config, provider_id.as_deref())
+    command_param_str(params, "workspace_id")
+        .or_else(|| config.workspace_id.clone())
+        .filter(|value| !value.trim().is_empty())
         .ok_or("Missing workspace_id".to_string())
 }
 
@@ -985,7 +958,7 @@ fn handle_connect_live_share_session(params: &JsonValue) -> Result<JsonValue, St
         .ok_or("Missing session_code")?;
 
     ensure_runtime_session(&workspace_id, write_to_disk)?;
-    host_bridge::ws_connect(
+    host::ws::connect(
         &server_url,
         &workspace_id,
         auth_token.as_deref(),
@@ -1002,7 +975,7 @@ fn handle_connect_live_share_session(params: &JsonValue) -> Result<JsonValue, St
 }
 
 fn handle_disconnect_live_share_session(_params: &JsonValue) -> Result<JsonValue, String> {
-    host_bridge::ws_disconnect()?;
+    host::ws::disconnect()?;
     reconcile_sync_transport(Some(true));
 
     Ok(serde_json::json!({
@@ -1026,8 +999,12 @@ fn build_manifest() -> GuestManifest {
                 label: "Account".into(),
                 description: Some("Sign in to enable sync.".into()),
             },
+            SettingsField::UpgradeBanner {
+                feature: "Sync".into(),
+                description: Some("Upgrade to sync workspaces across devices.".into()),
+            },
             SettingsField::Conditional {
-                condition: "authenticated".into(),
+                condition: "plus".into(),
                 fields: vec![
                     SettingsField::Section {
                         label: "Connection".into(),
@@ -1036,25 +1013,13 @@ fn build_manifest() -> GuestManifest {
                     SettingsField::Text {
                         key: "server_url".into(),
                         label: "Server URL".into(),
-                        description: Some(
-                            "Automatically configured when you sign in.".into(),
-                        ),
+                        description: Some("Automatically configured when you sign in.".into()),
                         placeholder: Some("https://sync.diaryx.org".into()),
                     },
                     SettingsField::Button {
                         label: "Check Status".into(),
                         command: "GetProviderStatus".into(),
                         variant: Some("outline".into()),
-                    },
-                    SettingsField::Conditional {
-                        condition: "not_plus".into(),
-                        fields: vec![SettingsField::UpgradeBanner {
-                            feature: "Sync".into(),
-                            description: Some(
-                                "Free includes one synced workspace on up to two devices. Upgrade to Plus for more workspaces and 2 GB storage."
-                                    .into(),
-                            ),
-                        }],
                     },
                 ],
             },
@@ -1090,6 +1055,7 @@ fn build_manifest() -> GuestManifest {
     };
 
     GuestManifest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
         id: "diaryx.sync".into(),
         name: "Sync".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -1114,24 +1080,24 @@ fn build_manifest() -> GuestManifest {
             }),
         ],
         commands: all_commands(),
-        requested_permissions: Some(serde_json::json!({
-            "defaults": {
+        requested_permissions: Some(GuestRequestedPermissions {
+            defaults: serde_json::json!({
                 "plugin_storage": { "include": ["all"], "exclude": [] },
                 "http_requests": { "include": ["all"], "exclude": [] },
                 "read_files": { "include": ["all"], "exclude": [] },
                 "edit_files": { "include": ["all"], "exclude": [] },
                 "create_files": { "include": ["all"], "exclude": [] },
                 "delete_files": { "include": ["all"], "exclude": [] },
-            },
-            "reasons": {
-                "plugin_storage": "Store sync configuration and CRDT state",
-                "http_requests": "Communicate with the sync server",
-                "read_files": "Read workspace files for syncing",
-                "edit_files": "Apply remote changes to workspace files",
-                "create_files": "Create files received from remote sync",
-                "delete_files": "Delete files removed by remote sync",
-            }
-        })),
+            }),
+            reasons: [
+                ("plugin_storage", "Store sync configuration and CRDT state"),
+                ("http_requests", "Communicate with the sync server"),
+                ("read_files", "Read workspace files for syncing"),
+                ("edit_files", "Apply remote changes to workspace files"),
+                ("create_files", "Create files received from remote sync"),
+                ("delete_files", "Delete files removed by remote sync"),
+            ].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }),
         cli: vec![serde_json::json!({
             "name": "sync",
             "about": "Sync workspace with remote server",
@@ -1244,34 +1210,26 @@ pub fn init(input: String) -> FnResult<String> {
 
     reconcile_sync_transport(params.write_to_disk);
 
-    host_bridge::log_message("info", "Sync plugin initialized");
+    host::log::log("info", "Sync plugin initialized");
     Ok(String::new())
 }
 
 /// Shut down the plugin (persist state).
 #[plugin_fn]
 pub fn shutdown(_input: String) -> FnResult<String> {
-    let _ = host_bridge::ws_disconnect();
+    let _ = host::ws::disconnect();
     if let Err(e) = state::shutdown_state() {
-        host_bridge::log_message("warn", &format!("Shutdown state cleanup failed: {e}"));
+        host::log::log("warn", &format!("Shutdown state cleanup failed: {e}"));
     }
-    host_bridge::log_message("info", "Sync plugin shut down");
+    host::log::log("info", "Sync plugin shut down");
     Ok(String::new())
 }
 
 /// Handle a structured command.
 fn command_response(result: Result<JsonValue, String>) -> CommandResponse {
     match result {
-        Ok(data) => CommandResponse {
-            success: true,
-            data: Some(data),
-            error: None,
-        },
-        Err(error) => CommandResponse {
-            success: false,
-            data: None,
-            error: Some(error),
-        },
+        Ok(data) => CommandResponse::ok(data),
+        Err(error) => CommandResponse::err(error),
     }
 }
 
@@ -1281,7 +1239,7 @@ fn execute_command(req: CommandRequest) -> CommandResponse {
         command.as_str(),
         "get_component_html" | "get_config" | "set_config"
     ) {
-        host_bridge::log_message("debug", &format!("[sync] handle_command: {command}"));
+        host::log::log("debug", &format!("[sync] handle_command: {command}"));
     }
 
     let custom_result: Option<Result<JsonValue, String>> = match command.as_str() {
@@ -1290,7 +1248,7 @@ fn execute_command(req: CommandRequest) -> CommandResponse {
                 .get("component_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            host_bridge::log_message(
+            host::log::log(
                 "debug",
                 &format!("[sync] get_component_html requested: {component_id}"),
             );
@@ -1339,21 +1297,9 @@ fn execute_command(req: CommandRequest) -> CommandResponse {
     };
 
     match result {
-        Some(Ok(data)) => CommandResponse {
-            success: true,
-            data: Some(data),
-            error: None,
-        },
-        Some(Err(e)) => CommandResponse {
-            success: false,
-            data: None,
-            error: Some(e.to_string()),
-        },
-        None => CommandResponse {
-            success: false,
-            data: None,
-            error: Some(format!("Unknown command: {command}")),
-        },
+        Some(Ok(data)) => CommandResponse::ok(data),
+        Some(Err(e)) => CommandResponse::err(e.to_string()),
+        None => CommandResponse::err(format!("Unknown command: {command}")),
     }
 }
 
@@ -1374,73 +1320,104 @@ pub fn on_event(input: String) -> FnResult<String> {
     match event.event_type.as_str() {
         "file_saved" => {
             if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
-                if let Err(e) = state::with_sync_plugin(|sync_plugin| {
-                    match host_bridge::read_file(path) {
+                let body_changed = event
+                    .payload
+                    .get("body_changed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                host::log::log(
+                    "debug",
+                    &format!(
+                        "[on_event:file_saved] path={} body_changed={}",
+                        path, body_changed
+                    ),
+                );
+                if let Err(e) = state::with_sync_plugin(|sync_plugin| match host::fs::read_file(
+                    path,
+                ) {
                     Ok(content) => {
-                        let body = frontmatter::extract_body(&content);
-                        // Update body CRDT
-                        let body_docs = sync_plugin.body_docs();
-                        let doc = body_docs.get_or_create(path);
-                        let _ = doc.set_body(&body);
-                        // Emit body update to sync peers
-                        if let Err(e) = sync_plugin.sync_manager().emit_body_update(path, &content) {
-                            host_bridge::log_message("warn", &format!(
-                                "[on_event:file_saved] emit_body_update FAILED for {}: {}", path, e
-                            ));
+                        let existing_parent_path =
+                            parse_workspace_metadata_from_markdown(sync_plugin, path, &content)
+                                .map(|(_, metadata)| metadata.part_of)
+                                .unwrap_or(None);
+                        let relative_path = workspace_relative_path_for_sync(sync_plugin, path);
+                        let previous_parent_path = sync_plugin
+                            .workspace_crdt()
+                            .get_file(&relative_path)
+                            .and_then(|metadata| metadata.part_of);
+                        if body_changed {
+                            let body = frontmatter::extract_body(&content);
+                            let body_docs = sync_plugin.body_docs();
+                            let existing_doc = body_docs.get(path);
+                            let should_emit_local_body_update = existing_doc.is_some()
+                                || sync_plugin.sync_manager().is_body_synced(path);
+                            if should_emit_local_body_update {
+                                let doc =
+                                    existing_doc.unwrap_or_else(|| body_docs.get_or_create(path));
+                                let _ = doc.set_body(&body);
+                            } else {
+                                host::log::log(
+                                    "debug",
+                                    &format!(
+                                        "[on_event:file_saved] skipping local body queue for unsynced doc {}",
+                                        path
+                                    ),
+                                );
+                            }
+                            sync_plugin.sync_manager().track_content(path, &body);
                         }
-                        // Update workspace CRDT metadata using relative path
-                        let ws_root = sync_plugin.sync_handler().get_workspace_root();
-                        let rel_path = relative_snapshot_path(
-                            ws_root.as_ref().and_then(|p| p.to_str()),
-                            path,
-                        )
-                        .unwrap_or_else(|| path.to_string());
-                        if let Ok((metadata, _)) =
-                            diaryx_sync::materialize::parse_snapshot_markdown(&rel_path, &content)
-                        {
-                            let ws = sync_plugin.workspace_crdt();
-                            let _ = ws.set_file(&rel_path, metadata);
-                            sync_plugin.sync_manager().rebuild_uuid_maps();
-                            let _ = sync_plugin.sync_manager().emit_workspace_update();
+                        let mut changed =
+                            parse_workspace_metadata_from_markdown(sync_plugin, path, &content)
+                                .map(|(relative_path, metadata)| {
+                                    apply_workspace_metadata(sync_plugin, &relative_path, &metadata)
+                                })
+                                .unwrap_or(false);
+                        changed |= refresh_related_parent_indexes(
+                            sync_plugin,
+                            &[previous_parent_path, existing_parent_path],
+                        );
+                        if changed {
+                            flush_workspace_metadata_changes(sync_plugin);
                         }
                     }
                     Err(e) => {
-                        host_bridge::log_message("warn", &format!(
-                            "[on_event:file_saved] read_file FAILED for {}: {}", path, e
-                        ));
-                    }
+                        host::log::log(
+                            "warn",
+                            &format!("[on_event:file_saved] read_file FAILED for {}: {}", path, e),
+                        );
                     }
                 }) {
-                    host_bridge::log_message("warn", &format!("[on_event:file_saved] {e}"));
+                    host::log::log("warn", &format!("[on_event:file_saved] {e}"));
                 }
             }
         }
         "file_created" => {
             if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
                 if let Err(e) = state::with_sync_plugin(|sync_plugin| {
-                    if let Ok(content) = host_bridge::read_file(path) {
-                        // Update body CRDT
+                    if let Ok(content) = host::fs::read_file(path) {
                         let body_docs = sync_plugin.body_docs();
                         let doc = body_docs.get_or_create(path);
                         let _ = doc.set_body(frontmatter::extract_body(&content));
-                        // Update workspace CRDT metadata using relative path
-                        let ws_root = sync_plugin.sync_handler().get_workspace_root();
-                        let rel_path = relative_snapshot_path(
-                            ws_root.as_ref().and_then(|p| p.to_str()),
-                            path,
-                        )
-                        .unwrap_or_else(|| path.to_string());
-                        if let Ok((metadata, _)) =
-                            diaryx_sync::materialize::parse_snapshot_markdown(&rel_path, &content)
-                        {
-                            let ws = sync_plugin.workspace_crdt();
-                            let _ = ws.set_file(&rel_path, metadata);
-                            sync_plugin.sync_manager().rebuild_uuid_maps();
-                            let _ = sync_plugin.sync_manager().emit_workspace_update();
+                        let changed =
+                            parse_workspace_metadata_from_markdown(sync_plugin, path, &content)
+                                .map(|(relative_path, metadata)| {
+                                    let parent_path = metadata.part_of.clone();
+                                    let mut changed = apply_workspace_metadata(
+                                        sync_plugin,
+                                        &relative_path,
+                                        &metadata,
+                                    );
+                                    changed |=
+                                        refresh_related_parent_indexes(sync_plugin, &[parent_path]);
+                                    changed
+                                })
+                                .unwrap_or(false);
+                        if changed {
+                            flush_workspace_metadata_changes(sync_plugin);
                         }
                     }
                 }) {
-                    host_bridge::log_message("warn", &format!("[on_event:file_created] {e}"));
+                    host::log::log("warn", &format!("[on_event:file_created] {e}"));
                 }
             }
         }
@@ -1449,78 +1426,65 @@ pub fn on_event(input: String) -> FnResult<String> {
                 if let Err(e) = state::with_sync_plugin(|sync_plugin| {
                     let body_docs = sync_plugin.body_docs();
                     let _ = body_docs.delete(path);
-                    // Mark as deleted in workspace CRDT using relative path
-                    let ws_root = sync_plugin.sync_handler().get_workspace_root();
-                    let rel_path = relative_snapshot_path(
-                        ws_root.as_ref().and_then(|p| p.to_str()),
-                        path,
-                    )
-                    .unwrap_or_else(|| path.to_string());
-                    let ws = sync_plugin.workspace_crdt();
-                    // Cannot use ws.delete_file() - mark_deleted() panics in WASM
-                    soft_delete_file(&ws, &rel_path);
-                    let _ = sync_plugin.sync_manager().emit_workspace_update();
+                    let relative_path = workspace_relative_path_for_sync(sync_plugin, path);
+                    let workspace = sync_plugin.workspace_crdt();
+                    let previous_parent_path = workspace
+                        .get_file(&relative_path)
+                        .and_then(|metadata| metadata.part_of);
+                    let mut changed = soft_delete_file(&workspace, &relative_path);
+                    changed |= refresh_related_parent_indexes(sync_plugin, &[previous_parent_path]);
+                    if changed {
+                        flush_workspace_metadata_changes(sync_plugin);
+                    }
                 }) {
-                    host_bridge::log_message("warn", &format!("[on_event:file_deleted] {e}"));
+                    host::log::log("warn", &format!("[on_event:file_deleted] {e}"));
                 }
             }
         }
         "file_renamed" | "file_moved" => {
             let old_path = event.payload.get("old_path").and_then(|v| v.as_str());
             let new_path = event.payload.get("new_path").and_then(|v| v.as_str());
-            host_bridge::log_message("info", &format!(
-                "[on_event:{}] old_path={:?} new_path={:?}",
-                event.event_type, old_path, new_path
-            ));
             if let (Some(old), Some(new)) = (old_path, new_path) {
                 if let Err(e) = state::with_sync_plugin(|sync_plugin| {
-                    let body_docs = sync_plugin.body_docs();
-                    let _ = body_docs.rename(old, new);
-                    // Update workspace CRDT using relative paths
-                    let ws_root = sync_plugin.sync_handler().get_workspace_root();
-                    let ws_root_str = ws_root.as_ref().and_then(|p| p.to_str());
-                    let old_rel = relative_snapshot_path(ws_root_str, old)
-                        .unwrap_or_else(|| old.to_string());
-                    let new_rel = relative_snapshot_path(ws_root_str, new)
-                        .unwrap_or_else(|| new.to_string());
-                    let ws = sync_plugin.workspace_crdt();
-                    if let Ok(content) = host_bridge::read_file(new) {
-                        if let Ok((metadata, _)) =
-                            diaryx_sync::materialize::parse_snapshot_markdown(&new_rel, &content)
+                    sync_plugin
+                        .sync_manager()
+                        .migrate_body_docs_for_renames(&[(old.to_string(), new.to_string())]);
+                    let old_relative_path = workspace_relative_path_for_sync(sync_plugin, old);
+                    let new_relative_path = workspace_relative_path_for_sync(sync_plugin, new);
+                    let workspace = sync_plugin.workspace_crdt();
+                    let previous_parent_path = workspace
+                        .get_file(&old_relative_path)
+                        .and_then(|metadata| metadata.part_of);
+                    if let Ok(content) = host::fs::read_file(new) {
+                        if let Some((_, metadata)) =
+                            parse_workspace_metadata_from_markdown(sync_plugin, new, &content)
                         {
-                            // Soft-delete old file. Cannot use ws.delete_file()
-                            // because mark_deleted() uses chrono::Utc::now()
-                            // which panics in the Extism WASM sandbox.
-                            soft_delete_file(&ws, &old_rel);
-                            let _ = ws.set_file(&new_rel, metadata);
-                            // Rebuild UUID maps so the new path can be resolved
-                            // immediately for body sync subscription.
-                            sync_plugin.sync_manager().rebuild_uuid_maps();
-                            let _ = sync_plugin.sync_manager().emit_workspace_update();
+                            let next_parent_path = metadata.part_of.clone();
+                            let mut changed = soft_delete_file(&workspace, &old_relative_path);
+                            changed |= apply_workspace_metadata(
+                                sync_plugin,
+                                &new_relative_path,
+                                &metadata,
+                            );
+                            changed |= refresh_related_parent_indexes(
+                                sync_plugin,
+                                &[previous_parent_path, next_parent_path],
+                            );
+                            if changed {
+                                flush_workspace_metadata_changes(sync_plugin);
+                            }
                         }
                     } else {
-                        host_bridge::log_message("warn", &format!(
-                            "[on_event:{}] host_read_file({}) failed", event.event_type, new
-                        ));
+                        host::log::log(
+                            "warn",
+                            &format!(
+                                "[on_event:{}] host_read_file({}) failed",
+                                event.event_type, new
+                            ),
+                        );
                     }
                 }) {
-                    host_bridge::log_message("warn", &format!("[on_event:file_renamed] {e}"));
-                }
-
-                // After the rename, subscribe to the new body doc_id on the server.
-                // Without this, the local client sends raw updates to the new doc_id
-                // but the server doesn't know to forward other clients' updates back.
-                if let Some(new) = new_path {
-                    session_actions = state::with_session_mut(|session| {
-                        poll_future(session.process(IncomingEvent::SyncBodyFiles {
-                            file_paths: vec![new.to_string()],
-                        }))
-                    })
-                    .map(|actions| actions.unwrap_or_default())
-                    .unwrap_or_else(|e| {
-                        host_bridge::log_message("warn", &format!("[on_event:file_renamed:sync_body] {e}"));
-                        vec![]
-                    });
+                    host::log::log("warn", &format!("[on_event:file_renamed] {e}"));
                 }
             }
         }
@@ -1535,26 +1499,21 @@ pub fn on_event(input: String) -> FnResult<String> {
                         &event,
                     ));
                 }) {
-                    host_bridge::log_message("warn", &format!("[on_event:workspace_opened] {e}"));
+                    host::log::log("warn", &format!("[on_event:workspace_opened] {e}"));
                 }
             }
         }
         "file_opened" => {
             if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
-                session_actions = state::with_session_mut(|session| {
+                session_actions = with_session_actions("on_event:file_opened", |session| {
                     poll_future(session.process(IncomingEvent::SyncBodyFiles {
                         file_paths: vec![path.to_string()],
                     }))
                 })
-                .map(|actions| actions.unwrap_or_default())
-                .unwrap_or_else(|e| {
-                    host_bridge::log_message("warn", &format!("[on_event:file_opened] {e}"));
-                    vec![]
-                });
             }
         }
         other => {
-            host_bridge::log_message("debug", &format!("Unhandled event type: {other}"));
+            host::log::log("debug", &format!("Unhandled event type: {other}"));
         }
     }
 
@@ -1588,13 +1547,8 @@ pub fn set_config(input: String) -> FnResult<String> {
 /// Output: binary action envelope for compatibility with native callers.
 #[plugin_fn]
 pub fn handle_binary_message(input: Vec<u8>) -> FnResult<Vec<u8>> {
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("handle_binary_message", |session| {
         poll_future(session.process(IncomingEvent::BinaryMessage(input)))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[handle_binary_message] {e}"));
-        vec![]
     });
     let encoded = binary_protocol::encode_actions(&actions);
     execute_session_actions(actions);
@@ -1606,13 +1560,8 @@ pub fn handle_binary_message(input: Vec<u8>) -> FnResult<Vec<u8>> {
 /// Output: binary action envelope for compatibility with native callers.
 #[plugin_fn]
 pub fn handle_text_message(input: String) -> FnResult<Vec<u8>> {
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("handle_text_message", |session| {
         poll_future(session.process(IncomingEvent::TextMessage(input)))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[handle_text_message] {e}"));
-        vec![]
     });
     let encoded = binary_protocol::encode_actions(&actions);
     execute_session_actions(actions);
@@ -1629,7 +1578,7 @@ pub fn on_connected(input: String) -> FnResult<Vec<u8>> {
         if let Some(ws_id) = params.workspace_id {
             let write_to_disk = params.write_to_disk.unwrap_or(true);
             if let Err(e) = state::create_session(&ws_id, write_to_disk) {
-                host_bridge::log_message(
+                host::log::log(
                     "warn",
                     &format!("[on_connected] create_session failed: {e}"),
                 );
@@ -1637,13 +1586,8 @@ pub fn on_connected(input: String) -> FnResult<Vec<u8>> {
         }
     }
 
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("on_connected", |session| {
         poll_future(session.process(IncomingEvent::Connected))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[on_connected] {e}"));
-        vec![]
     });
     let encoded = binary_protocol::encode_actions(&actions);
     execute_session_actions(actions);
@@ -1654,18 +1598,13 @@ pub fn on_connected(input: String) -> FnResult<Vec<u8>> {
 /// Output: binary action envelope for compatibility with native callers.
 #[plugin_fn]
 pub fn on_disconnected(_input: String) -> FnResult<Vec<u8>> {
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("on_disconnected", |session| {
         poll_future(session.process(IncomingEvent::Disconnected))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[on_disconnected] {e}"));
-        vec![]
     });
 
     // Persist state on disconnect
     if let Err(e) = state::persist_state() {
-        host_bridge::log_message(
+        host::log::log(
             "warn",
             &format!("[on_disconnected] persist_state failed: {e}"),
         );
@@ -1694,13 +1633,8 @@ pub fn queue_local_update(input: String) -> FnResult<Vec<u8>> {
         .decode(data_b64)
         .unwrap_or_default();
 
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("queue_local_update", |session| {
         poll_future(session.process(IncomingEvent::LocalUpdate { doc_id, data }))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[queue_local_update] {e}"));
-        vec![]
     });
     let encoded = binary_protocol::encode_actions(&actions);
     execute_session_actions(actions);
@@ -1711,13 +1645,8 @@ pub fn queue_local_update(input: String) -> FnResult<Vec<u8>> {
 /// Output: binary action envelope for compatibility with native callers.
 #[plugin_fn]
 pub fn on_snapshot_imported(_input: String) -> FnResult<Vec<u8>> {
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("on_snapshot_imported", |session| {
         poll_future(session.process(IncomingEvent::SnapshotImported))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[on_snapshot_imported] {e}"));
-        vec![]
     });
     let encoded = binary_protocol::encode_actions(&actions);
     execute_session_actions(actions);
@@ -1735,13 +1664,8 @@ pub fn sync_body_files(input: String) -> FnResult<Vec<u8>> {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    let actions = state::with_session_mut(|session| {
+    let actions = with_session_actions("sync_body_files", |session| {
         poll_future(session.process(IncomingEvent::SyncBodyFiles { file_paths }))
-    })
-    .map(|actions| actions.unwrap_or_default())
-    .unwrap_or_else(|e| {
-        host_bridge::log_message("warn", &format!("[sync_body_files] {e}"));
-        vec![]
     });
     let encoded = binary_protocol::encode_actions(&actions);
     execute_session_actions(actions);
@@ -1931,7 +1855,10 @@ mod tests {
         );
 
         // Should have declarative fields
-        let fields = tab.get("fields").and_then(|v| v.as_array()).expect("fields should be an array");
+        let fields = tab
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .expect("fields should be an array");
         assert!(!fields.is_empty(), "fields should not be empty");
 
         // First field: AuthStatus
@@ -1970,10 +1897,7 @@ mod tests {
             nested[0].get("type").and_then(|v| v.as_str()),
             Some("Section")
         );
-        assert_eq!(
-            nested[1].get("type").and_then(|v| v.as_str()),
-            Some("Text")
-        );
+        assert_eq!(nested[1].get("type").and_then(|v| v.as_str()), Some("Text"));
         assert_eq!(
             nested[1].get("key").and_then(|v| v.as_str()),
             Some("server_url")
@@ -1991,9 +1915,12 @@ mod tests {
     #[test]
     fn manifest_no_longer_exposes_share_tab() {
         let manifest = build_manifest();
-        assert!(manifest.ui.iter().all(|ui| {
-            ui.get("id").and_then(|v| v.as_str()) != Some("share")
-        }));
+        assert!(
+            manifest
+                .ui
+                .iter()
+                .all(|ui| { ui.get("id").and_then(|v| v.as_str()) != Some("share") })
+        );
     }
 
     #[test]
@@ -2019,9 +1946,7 @@ mod tests {
             .requested_permissions
             .as_ref()
             .expect("manifest should declare requested_permissions");
-        let defaults = perms
-            .get("defaults")
-            .expect("should have defaults");
+        let defaults = perms.get("defaults").expect("should have defaults");
 
         assert!(defaults.get("plugin_storage").is_some());
         assert!(defaults.get("http_requests").is_some());
@@ -2036,8 +1961,16 @@ mod tests {
             .and_then(|include| include.as_array())
             .expect("edit_files should declare include rules");
 
-        assert!(read_include.iter().any(|value| value.as_str() == Some("all")));
-        assert!(edit_include.iter().any(|value| value.as_str() == Some("all")));
+        assert!(
+            read_include
+                .iter()
+                .any(|value| value.as_str() == Some("all"))
+        );
+        assert!(
+            edit_include
+                .iter()
+                .any(|value| value.as_str() == Some("all"))
+        );
     }
 
     #[test]
