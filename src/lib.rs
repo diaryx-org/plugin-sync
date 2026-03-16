@@ -1054,107 +1054,106 @@ fn build_manifest() -> GuestManifest {
         plugin_command: Some("GetSyncStatus".into()),
     };
 
-    GuestManifest {
-        protocol_version: CURRENT_PROTOCOL_VERSION,
-        id: "diaryx.sync".into(),
-        name: "Sync".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        description: "Real-time CRDT sync across devices".into(),
-        capabilities: vec![
+    GuestManifest::new(
+        "diaryx.sync",
+        "Sync",
+        env!("CARGO_PKG_VERSION"),
+        "Real-time CRDT sync across devices",
+        vec![
             "workspace_events".into(),
             "file_events".into(),
             "crdt_commands".into(),
             "sync_transport".into(),
             "custom_commands".into(),
         ],
-        ui: vec![
-            serde_json::to_value(&sync_settings_tab).unwrap_or_default(),
-            serde_json::to_value(&snapshots_tab).unwrap_or_default(),
-            serde_json::to_value(&history_tab).unwrap_or_default(),
-            serde_json::to_value(&status_bar_item).unwrap_or_default(),
-            serde_json::json!({
-                "slot": "WorkspaceProvider",
-                "id": "diaryx.sync",
-                "label": "Diaryx Sync",
-                "icon": "cloud",
-            }),
-        ],
-        commands: all_commands(),
-        requested_permissions: Some(GuestRequestedPermissions {
-            defaults: serde_json::json!({
-                "plugin_storage": { "include": ["all"], "exclude": [] },
-                "http_requests": { "include": ["all"], "exclude": [] },
-                "read_files": { "include": ["all"], "exclude": [] },
-                "edit_files": { "include": ["all"], "exclude": [] },
-                "create_files": { "include": ["all"], "exclude": [] },
-                "delete_files": { "include": ["all"], "exclude": [] },
-            }),
-            reasons: [
-                ("plugin_storage", "Store sync configuration and CRDT state"),
-                ("http_requests", "Communicate with the sync server"),
-                ("read_files", "Read workspace files for syncing"),
-                ("edit_files", "Apply remote changes to workspace files"),
-                ("create_files", "Create files received from remote sync"),
-                ("delete_files", "Delete files removed by remote sync"),
-            ].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    )
+    .ui(vec![
+        serde_json::to_value(&sync_settings_tab).unwrap_or_default(),
+        serde_json::to_value(&snapshots_tab).unwrap_or_default(),
+        serde_json::to_value(&history_tab).unwrap_or_default(),
+        serde_json::to_value(&status_bar_item).unwrap_or_default(),
+        serde_json::json!({
+            "slot": "WorkspaceProvider",
+            "id": "diaryx.sync",
+            "label": "Diaryx Sync",
+            "icon": "cloud",
         }),
-        cli: vec![serde_json::json!({
-            "name": "sync",
-            "about": "Sync workspace with remote server",
-            "aliases": ["sy"],
-            "subcommands": [
-                {
-                    "name": "login", "about": "Authenticate via magic link",
-                    "native_handler": "sync_login", "requires_workspace": false,
-                    "args": [
-                        {"name": "email", "required": true, "help": "Email address"},
-                        {"name": "server", "short": "s", "long": "server", "help": "Server URL"}
-                    ]
-                },
-                {
-                    "name": "verify", "about": "Complete authentication",
-                    "native_handler": "sync_verify", "requires_workspace": false,
-                    "args": [
-                        {"name": "token", "required": true, "help": "Verification token"},
-                        {"name": "device-name", "long": "device-name", "help": "Device name"}
-                    ]
-                },
-                {
-                    "name": "logout", "about": "Clear credentials",
-                    "native_handler": "sync_logout", "requires_workspace": false
-                },
-                {
-                    "name": "status", "about": "Show sync status",
-                    "native_handler": "sync_status"
-                },
-                {
-                    "name": "start", "about": "Start continuous sync",
-                    "native_handler": "sync_start",
-                    "args": [
-                        {"name": "background", "short": "b", "long": "background",
-                         "is_flag": true, "help": "Run in background"}
-                    ]
-                },
-                {
-                    "name": "push", "about": "Push local changes",
-                    "native_handler": "sync_push"
-                },
-                {
-                    "name": "pull", "about": "Pull remote changes",
-                    "native_handler": "sync_pull"
-                },
-                {
-                    "name": "config", "about": "Configure sync settings",
-                    "native_handler": "sync_config",
-                    "args": [
-                        {"name": "server", "long": "server", "help": "Set server URL"},
-                        {"name": "workspace-id", "long": "workspace-id", "help": "Set workspace ID"},
-                        {"name": "show", "long": "show", "is_flag": true, "help": "Show current config"}
-                    ]
-                }
-            ]
-        })],
-    }
+    ])
+    .commands(all_commands())
+    .requested_permissions(GuestRequestedPermissions {
+        defaults: serde_json::json!({
+            "plugin_storage": { "include": ["all"], "exclude": [] },
+            "http_requests": { "include": ["all"], "exclude": [] },
+            "read_files": { "include": ["all"], "exclude": [] },
+            "edit_files": { "include": ["all"], "exclude": [] },
+            "create_files": { "include": ["all"], "exclude": [] },
+            "delete_files": { "include": ["all"], "exclude": [] },
+        }),
+        reasons: [
+            ("plugin_storage", "Store sync configuration and CRDT state"),
+            ("http_requests", "Communicate with the sync server"),
+            ("read_files", "Read workspace files for syncing"),
+            ("edit_files", "Apply remote changes to workspace files"),
+            ("create_files", "Create files received from remote sync"),
+            ("delete_files", "Delete files removed by remote sync"),
+        ].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    })
+    .cli(vec![serde_json::json!({
+        "name": "sync",
+        "about": "Sync workspace with remote server",
+        "aliases": ["sy"],
+        "subcommands": [
+            {
+                "name": "login", "about": "Authenticate via magic link",
+                "native_handler": "sync_login", "requires_workspace": false,
+                "args": [
+                    {"name": "email", "required": true, "help": "Email address"},
+                    {"name": "server", "short": "s", "long": "server", "help": "Server URL"}
+                ]
+            },
+            {
+                "name": "verify", "about": "Complete authentication",
+                "native_handler": "sync_verify", "requires_workspace": false,
+                "args": [
+                    {"name": "token", "required": true, "help": "Verification token"},
+                    {"name": "device-name", "long": "device-name", "help": "Device name"}
+                ]
+            },
+            {
+                "name": "logout", "about": "Clear credentials",
+                "native_handler": "sync_logout", "requires_workspace": false
+            },
+            {
+                "name": "status", "about": "Show sync status",
+                "native_handler": "sync_status"
+            },
+            {
+                "name": "start", "about": "Start continuous sync",
+                "native_handler": "sync_start",
+                "args": [
+                    {"name": "background", "short": "b", "long": "background",
+                     "is_flag": true, "help": "Run in background"}
+                ]
+            },
+            {
+                "name": "push", "about": "Push local changes",
+                "native_handler": "sync_push"
+            },
+            {
+                "name": "pull", "about": "Pull remote changes",
+                "native_handler": "sync_pull"
+            },
+            {
+                "name": "config", "about": "Configure sync settings",
+                "native_handler": "sync_config",
+                "args": [
+                    {"name": "server", "long": "server", "help": "Set server URL"},
+                    {"name": "workspace-id", "long": "workspace-id", "help": "Set workspace ID"},
+                    {"name": "show", "long": "show", "is_flag": true, "help": "Show current config"}
+                ]
+            }
+        ]
+    })])
 }
 
 #[plugin_fn]
