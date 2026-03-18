@@ -26,6 +26,7 @@ pub mod binary_protocol;
 pub mod host_fs;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_extism_stubs;
+pub mod server_api;
 pub mod state;
 
 use diaryx_plugin_sdk::prelude::*;
@@ -43,6 +44,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 use diaryx_core::plugin::{
     ComponentRef, SettingsField, SidebarSide, StatusBarPosition, UiContribution,
 };
+use diaryx_plugin_sdk::protocol::ServerFunctionDecl;
 use diaryx_sync::{IncomingEvent, SessionAction};
 
 // ============================================================================
@@ -1080,6 +1082,68 @@ fn build_manifest() -> GuestManifest {
         }),
     ])
     .commands(all_commands())
+    .server_functions(vec![
+        ServerFunctionDecl {
+            name: "sync_ws".into(),
+            method: "WS".into(),
+            path: "/namespaces/{id}/sync".into(),
+            description: "WebSocket CRDT relay for real-time sync".into(),
+        },
+        ServerFunctionDecl {
+            name: "create_namespace".into(),
+            method: "POST".into(),
+            path: "/namespaces".into(),
+            description: "Create a user-owned namespace".into(),
+        },
+        ServerFunctionDecl {
+            name: "list_namespaces".into(),
+            method: "GET".into(),
+            path: "/namespaces".into(),
+            description: "List namespaces owned by the authenticated user".into(),
+        },
+        ServerFunctionDecl {
+            name: "put_object".into(),
+            method: "PUT".into(),
+            path: "/namespaces/{id}/objects/{key}".into(),
+            description: "Store bytes under the given key in a namespace".into(),
+        },
+        ServerFunctionDecl {
+            name: "get_object".into(),
+            method: "GET".into(),
+            path: "/namespaces/{id}/objects/{key}".into(),
+            description: "Retrieve bytes by key from a namespace".into(),
+        },
+        ServerFunctionDecl {
+            name: "delete_object".into(),
+            method: "DELETE".into(),
+            path: "/namespaces/{id}/objects/{key}".into(),
+            description: "Delete an object from a namespace".into(),
+        },
+        ServerFunctionDecl {
+            name: "list_objects".into(),
+            method: "GET".into(),
+            path: "/namespaces/{id}/objects".into(),
+            description: "List object metadata in a namespace".into(),
+        },
+        ServerFunctionDecl {
+            name: "create_session".into(),
+            method: "POST".into(),
+            path: "/sessions".into(),
+            description: "Create a share session for a namespace".into(),
+        },
+        ServerFunctionDecl {
+            name: "get_session".into(),
+            method: "GET".into(),
+            path: "/sessions/{code}".into(),
+            description: "Look up a session by code".into(),
+        },
+        ServerFunctionDecl {
+            name: "delete_session".into(),
+            method: "DELETE".into(),
+            path: "/sessions/{code}".into(),
+            description: "End a session".into(),
+        },
+    ])
     .requested_permissions(GuestRequestedPermissions {
         defaults: serde_json::json!({
             "plugin_storage": { "include": ["all"], "exclude": [] },
@@ -1277,6 +1341,16 @@ fn execute_command(req: CommandRequest) -> CommandResponse {
         "PrepareLiveShareRuntime" => Some(handle_prepare_live_share_runtime(&params)),
         "ConnectLiveShareSession" => Some(handle_connect_live_share_session(&params)),
         "DisconnectLiveShareSession" => Some(handle_disconnect_live_share_session(&params)),
+        // Namespace API commands
+        "NsCreateNamespace" => Some(handle_ns_create_namespace(&params)),
+        "NsListNamespaces" => Some(handle_ns_list_namespaces(&params)),
+        "NsPutObject" => Some(handle_ns_put_object(&params)),
+        "NsGetObject" => Some(handle_ns_get_object(&params)),
+        "NsDeleteObject" => Some(handle_ns_delete_object(&params)),
+        "NsListObjects" => Some(handle_ns_list_objects(&params)),
+        "NsCreateSession" => Some(handle_ns_create_session(&params)),
+        "NsGetSession" => Some(handle_ns_get_session(&params)),
+        "NsDeleteSession" => Some(handle_ns_delete_session(&params)),
         _ => None,
     };
 
@@ -1723,6 +1797,73 @@ pub fn execute_typed_command(input: String) -> FnResult<String> {
 }
 
 /// List all commands this plugin handles.
+// ---------------------------------------------------------------------------
+// Namespace API command handlers
+// ---------------------------------------------------------------------------
+
+fn handle_ns_create_namespace(params: &JsonValue) -> Result<JsonValue, String> {
+    let ns_id = command_param_str(params, "namespace_id").ok_or("Missing namespace_id")?;
+    server_api::create_namespace(params, &ns_id)
+}
+
+fn handle_ns_list_namespaces(params: &JsonValue) -> Result<JsonValue, String> {
+    server_api::list_namespaces(params)
+}
+
+fn handle_ns_put_object(params: &JsonValue) -> Result<JsonValue, String> {
+    let ns_id = command_param_str(params, "namespace_id").ok_or("Missing namespace_id")?;
+    let key = command_param_str(params, "key").ok_or("Missing key")?;
+    let content_type = command_param_str(params, "content_type")
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Body can be provided as base64 data or plain text
+    let body: Vec<u8> = if let Some(b64) = command_param_str(params, "body_base64") {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64)
+            .map_err(|e| format!("Invalid base64: {}", e))?
+    } else if let Some(text) = command_param_str(params, "body") {
+        text.into_bytes()
+    } else {
+        return Err("Missing body or body_base64".to_string());
+    };
+
+    server_api::put_object(params, &ns_id, &key, &body, &content_type)
+}
+
+fn handle_ns_get_object(params: &JsonValue) -> Result<JsonValue, String> {
+    let ns_id = command_param_str(params, "namespace_id").ok_or("Missing namespace_id")?;
+    let key = command_param_str(params, "key").ok_or("Missing key")?;
+    server_api::get_object(params, &ns_id, &key)
+}
+
+fn handle_ns_delete_object(params: &JsonValue) -> Result<JsonValue, String> {
+    let ns_id = command_param_str(params, "namespace_id").ok_or("Missing namespace_id")?;
+    let key = command_param_str(params, "key").ok_or("Missing key")?;
+    server_api::delete_object(params, &ns_id, &key)?;
+    Ok(JsonValue::Null)
+}
+
+fn handle_ns_list_objects(params: &JsonValue) -> Result<JsonValue, String> {
+    let ns_id = command_param_str(params, "namespace_id").ok_or("Missing namespace_id")?;
+    server_api::list_objects(params, &ns_id)
+}
+
+fn handle_ns_create_session(params: &JsonValue) -> Result<JsonValue, String> {
+    let ns_id = command_param_str(params, "namespace_id").ok_or("Missing namespace_id")?;
+    let read_only = command_param_bool(params, "read_only").unwrap_or(false);
+    server_api::create_session(params, &ns_id, read_only)
+}
+
+fn handle_ns_get_session(params: &JsonValue) -> Result<JsonValue, String> {
+    let code = command_param_str(params, "code").ok_or("Missing code")?;
+    server_api::get_session(params, &code)
+}
+
+fn handle_ns_delete_session(params: &JsonValue) -> Result<JsonValue, String> {
+    let code = command_param_str(params, "code").ok_or("Missing code")?;
+    server_api::delete_session(params, &code)?;
+    Ok(JsonValue::Null)
+}
+
 fn all_commands() -> Vec<String> {
     vec![
         // Workspace CRDT State
@@ -1798,6 +1939,16 @@ fn all_commands() -> Vec<String> {
         "get_component_html",
         "get_config",
         "set_config",
+        // Namespace API
+        "NsCreateNamespace",
+        "NsListNamespaces",
+        "NsPutObject",
+        "NsGetObject",
+        "NsDeleteObject",
+        "NsListObjects",
+        "NsCreateSession",
+        "NsGetSession",
+        "NsDeleteSession",
     ]
     .into_iter()
     .map(String::from)
