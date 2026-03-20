@@ -83,3 +83,8 @@ stub_host_fn!(host_secret_set);
 stub_host_fn!(host_secret_delete);
 stub_host_fn!(host_run_wasi_module);
 stub_host_fn!(host_request_file);
+stub_host_fn!(host_namespace_put_object);
+stub_host_fn!(host_namespace_delete_object);
+stub_host_fn!(host_namespace_list_objects);
+stub_host_fn!(host_namespace_sync_audience);
+stub_host_fn!(host_hash_file);

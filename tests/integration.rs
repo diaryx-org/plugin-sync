@@ -6,12 +6,10 @@
 //! Prerequisites: `cargo build --target wasm32-unknown-unknown --release`
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use diaryx_core::plugin::manifest::{PluginCapability, UiContribution};
 use diaryx_extism::testing::*;
 use serde_json::{Value as JsonValue, json};
-use tokio::time::timeout;
 
 const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/diaryx_sync_extism.wasm";
 
@@ -49,14 +47,6 @@ fn load_with_storage_and_emitter(
         .expect("Failed to load sync plugin WASM")
 }
 
-fn unique_temp_dir(label: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("diaryx-plugin-sync-{label}-{nanos}"))
-}
-
 // ============================================================================
 // Category 1: Manifest & Metadata
 // ============================================================================
@@ -84,14 +74,6 @@ fn manifest_declares_expected_capabilities() {
         .capabilities
         .iter()
         .any(|c| matches!(c, PluginCapability::WorkspaceEvents));
-    let has_crdt_commands = manifest
-        .capabilities
-        .iter()
-        .any(|c| matches!(c, PluginCapability::CrdtCommands));
-    let has_sync_transport = manifest
-        .capabilities
-        .iter()
-        .any(|c| matches!(c, PluginCapability::SyncTransport));
     let has_custom_commands = manifest
         .capabilities
         .iter()
@@ -99,8 +81,6 @@ fn manifest_declares_expected_capabilities() {
 
     assert!(has_file_events, "Missing FileEvents capability");
     assert!(has_workspace_events, "Missing WorkspaceEvents capability");
-    assert!(has_crdt_commands, "Missing CrdtCommands capability");
-    assert!(has_sync_transport, "Missing SyncTransport capability");
     assert!(has_custom_commands, "Missing CustomCommands capability");
 }
 
@@ -124,7 +104,10 @@ fn manifest_declares_commands() {
 
     for expected in [
         "GetSyncStatus",
-        "SyncFocusedFileNow",
+        "SyncPush",
+        "SyncPull",
+        "Sync",
+        "SyncStatus",
         "GetProviderStatus",
         "get_config",
         "set_config",
@@ -198,24 +181,27 @@ async fn init_with_workspace_root() {
 }
 
 #[tokio::test]
-async fn shutdown_persists_crdt_state() {
+async fn shutdown_persists_sync_manifest() {
     require_wasm!();
     let storage = Arc::new(RecordingStorage::new());
     let harness = load_with_storage(storage.clone());
 
     harness.init().await.expect("init should succeed");
 
+    // Send a file event to create manifest state
+    harness.send_file_saved("docs/test.md").await;
+
     // Call shutdown to persist state
     let _ = harness.call_raw("shutdown", "");
 
-    // Check that workspace_crdt was written to storage (key is prefixed with plugin id)
+    // Check that sync_manifest was written to storage
     let ops = storage.ops();
-    let has_crdt_set = ops
+    let has_manifest_set = ops
         .iter()
-        .any(|op| matches!(op, StorageOp::Set(key, _) if key.ends_with("workspace_crdt")));
+        .any(|op| matches!(op, StorageOp::Set(key, _) if key.ends_with("sync_manifest")));
     assert!(
-        has_crdt_set,
-        "Shutdown should persist workspace_crdt to storage. Ops: {ops:?}"
+        has_manifest_set,
+        "Shutdown should persist sync_manifest to storage. Ops: {ops:?}"
     );
 }
 
@@ -304,8 +290,8 @@ async fn set_config_roundtrip() {
     );
     assert_eq!(
         config.get("auth_token").and_then(|v| v.as_str()),
-        None,
-        "effective config should redact auth_token and rely on runtime context"
+        Some("test-token-123"),
+        "auth_token should be stored in config"
     );
     assert_eq!(
         config.get("workspace_id").and_then(|v| v.as_str()),
@@ -369,13 +355,13 @@ async fn get_sync_status_returns_idle_initially() {
 
     assert_eq!(
         result.get("state").and_then(|v| v.as_str()),
-        Some("idle"),
-        "Initial sync status should be idle. Got: {result}"
+        Some("synced"),
+        "Initial sync status should be synced (no dirty files). Got: {result}"
     );
     assert_eq!(
         result.get("label").and_then(|v| v.as_str()),
-        Some("Idle"),
-        "Initial sync label should be Idle. Got: {result}"
+        Some("Not linked"),
+        "Initial sync label should be Not linked. Got: {result}"
     );
 }
 
@@ -436,291 +422,112 @@ async fn get_provider_status_ready_with_credentials() {
 // ============================================================================
 
 #[tokio::test]
-async fn get_sync_state_after_init() {
+async fn sync_status_initially_synced() {
     require_wasm!();
     let harness = load_sync_plugin();
     harness.init().await.expect("init");
 
     let result = harness
-        .command("GetSyncState", json!({}))
+        .command("SyncStatus", json!({}))
         .await
-        .expect("GetSyncState should return Some")
-        .expect("GetSyncState should succeed");
+        .expect("SyncStatus should return Some")
+        .expect("SyncStatus should succeed");
 
-    assert!(
-        !result.is_null(),
-        "GetSyncState should return non-null data. Got: {result}"
+    assert_eq!(
+        result.get("dirty_count").and_then(|v| v.as_u64()),
+        Some(0),
+        "Initial dirty_count should be 0. Got: {result}"
     );
 }
 
 #[tokio::test]
-async fn list_crdt_files_empty_initially() {
+async fn sync_push_fails_without_namespace() {
     require_wasm!();
     let harness = load_sync_plugin();
     harness.init().await.expect("init");
 
     let result = harness
-        .command("ListCrdtFiles", json!({}))
+        .command("SyncPush", json!({}))
         .await
-        .expect("ListCrdtFiles should return Some")
-        .expect("ListCrdtFiles should succeed");
-
-    let files = result
-        .as_array()
-        .expect("ListCrdtFiles should return an array");
-    assert!(
-        files.is_empty(),
-        "CRDT files should be empty initially. Got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn initialize_workspace_crdt_rejects_invalid_workspace() {
-    require_wasm!();
-    let harness = load_sync_plugin();
-    harness.init().await.expect("init");
-
-    // An empty temp directory is not a valid workspace
-    let tmp = std::env::temp_dir().join("diaryx-test-init-crdt-empty");
-    let _ = std::fs::create_dir_all(&tmp);
-
-    let result = harness
-        .command(
-            "InitializeWorkspaceCrdt",
-            json!({ "workspace_path": tmp.to_string_lossy() }),
-        )
-        .await
-        .expect("InitializeWorkspaceCrdt should return Some");
+        .expect("SyncPush should return Some");
 
     assert!(
         result.is_err(),
-        "InitializeWorkspaceCrdt should fail for invalid workspace. Got: {result:?}"
+        "SyncPush should fail without namespace. Got: {result:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[tokio::test]
-async fn initialize_workspace_crdt_reloads_new_files_after_local_create() {
-    require_wasm!();
-
-    let workspace_dir = unique_temp_dir("reinit-after-create");
-    std::fs::create_dir_all(&workspace_dir).expect("create workspace dir");
-
-    let readme_path = workspace_dir.join("README.md");
-    let child_path = workspace_dir.join("live-create.md");
-
-    std::fs::write(
-        &readme_path,
-        "---\n\
-title: Workspace Root\n\
-contents: []\n\
----\n\
-\n\
-Root body\n",
-    )
-    .expect("write README");
-
-    let harness = PluginTestHarnessBuilder::new(WASM_PATH)
-        .with_workspace_root(&workspace_dir)
-        .build()
-        .expect("Failed to load");
-    harness.init().await.expect("init");
-
-    timeout(
-        Duration::from_secs(5),
-        harness.command(
-            "InitializeWorkspaceCrdt",
-            json!({ "workspace_path": readme_path.to_string_lossy() }),
-        ),
-    )
-    .await
-    .expect("initial InitializeWorkspaceCrdt timed out")
-    .expect("InitializeWorkspaceCrdt should return Some")
-    .expect("initial InitializeWorkspaceCrdt should succeed");
-
-    std::fs::write(
-        &child_path,
-        "---\n\
-title: Live Create\n\
-part_of: /README.md\n\
----\n\
-\n\
-Child body\n",
-    )
-    .expect("write child");
-    std::fs::write(
-        &readme_path,
-        "---\n\
-title: Workspace Root\n\
-contents:\n\
-  - live-create.md\n\
----\n\
-\n\
-Root body\n",
-    )
-    .expect("update README");
-
-    harness.send_file_created("live-create.md").await;
-    harness.send_file_saved("README.md").await;
-
-    timeout(
-        Duration::from_secs(5),
-        harness.command(
-            "InitializeWorkspaceCrdt",
-            json!({ "workspace_path": readme_path.to_string_lossy() }),
-        ),
-    )
-    .await
-    .expect("second InitializeWorkspaceCrdt timed out")
-    .expect("InitializeWorkspaceCrdt should return Some")
-    .expect("second InitializeWorkspaceCrdt should succeed");
-
-    let files = harness
-        .command("ListCrdtFiles", json!({}))
-        .await
-        .expect("ListCrdtFiles should return Some")
-        .expect("ListCrdtFiles should succeed");
-    let files = files
-        .as_array()
-        .expect("ListCrdtFiles should return an array");
-    assert!(
-        files.iter().any(|value| {
-            value
-                .as_array()
-                .and_then(|entry| entry.first())
-                .and_then(|path| path.as_str())
-                == Some("live-create.md")
-        }),
-        "expected live-create.md in CRDT after second init, got {files:?}"
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace_dir);
-}
-
-#[tokio::test]
-async fn set_and_get_crdt_file() {
+async fn sync_pull_fails_without_namespace() {
     require_wasm!();
     let harness = load_sync_plugin();
     harness.init().await.expect("init");
 
-    // Set a CRDT file entry
-    harness
-        .command(
-            "SetCrdtFile",
-            json!({
-                "path": "docs/test-entry.md",
-                "metadata": {
-                    "title": "Test Entry",
-                    "created": "2025-01-01T00:00:00Z",
-                    "modified": "2025-01-01T00:00:00Z"
-                }
-            }),
-        )
+    let result = harness
+        .command("SyncPull", json!({}))
         .await
-        .expect("SetCrdtFile should return Some")
-        .expect("SetCrdtFile should succeed");
+        .expect("SyncPull should return Some");
 
-    // Read it back
-    let get_result = harness
-        .command("GetCrdtFile", json!({ "path": "docs/test-entry.md" }))
-        .await
-        .expect("GetCrdtFile should return Some")
-        .expect("GetCrdtFile should succeed");
-
-    // Should contain the path we set
-    let result_str = serde_json::to_string(&get_result).unwrap();
     assert!(
-        result_str.contains("test-entry") || result_str.contains("Test Entry"),
-        "GetCrdtFile should return the file we set. Got: {get_result}"
+        result.is_err(),
+        "SyncPull should fail without namespace. Got: {result:?}"
     );
 }
 
 #[tokio::test]
-async fn trigger_workspace_sync_emits_send_sync_message() {
+async fn file_events_mark_manifest_dirty() {
     require_wasm!();
     let storage = Arc::new(RecordingStorage::new());
-    let harness = load_with_storage_and_emitter(storage, Arc::new(RecordingEventEmitter::new()));
+    let emitter = Arc::new(RecordingEventEmitter::new());
+    let harness = load_with_storage_and_emitter(storage, emitter);
     harness.init().await.expect("init");
 
-    harness
-        .command(
-            "SetCrdtFile",
-            json!({
-                "path": "docs/test-entry.md",
-                "metadata": {
-                    "filename": "test-entry.md",
-                    "title": "Test Entry",
-                    "part_of": null,
-                    "contents": null,
-                    "attachments": [],
-                    "deleted": false,
-                    "audience": null,
-                    "description": "Propagation target",
-                    "extra": {},
-                    "modified_at": 1
-                }
-            }),
-        )
+    // Send file_created events
+    harness.send_file_created("docs/new-entry.md").await;
+    harness.send_file_saved("docs/existing-entry.md").await;
+
+    // Check status shows dirty files
+    let result = harness
+        .command("SyncStatus", json!({}))
         .await
-        .expect("Trigger setup should return Some")
-        .expect("SetCrdtFile should succeed");
+        .expect("SyncStatus should return Some")
+        .expect("SyncStatus should succeed");
 
-    let prepare = harness
-        .call_raw(
-            "handle_command",
-            &json!({
-                "command": "PrepareLiveShareRuntime",
-                "params": {
-                    "workspace_id": "workspace-1",
-                    "write_to_disk": true
-                }
-            })
-            .to_string(),
-        )
-        .expect("handle_command should succeed");
-    let prepared: JsonValue =
-        serde_json::from_str(&prepare).expect("prepare response should be valid json");
-
-    assert_eq!(
-        prepared.get("success").and_then(|value| value.as_bool()),
-        Some(true),
-        "PrepareLiveShareRuntime should succeed. Got: {prepared}"
-    );
-
-    let raw = harness
-        .call_raw(
-            "handle_command",
-            &json!({
-                "command": "TriggerWorkspaceSync",
-                "params": {}
-            })
-            .to_string(),
-        )
-        .expect("handle_command should succeed");
-    let result: JsonValue = serde_json::from_str(&raw).expect("response should be valid json");
-
-    assert_eq!(
-        result.get("success").and_then(|value| value.as_bool()),
-        Some(true),
-        "TriggerWorkspaceSync should succeed. Got: {result}"
-    );
-    assert_eq!(
-        result
-            .get("data")
-            .and_then(|value| value.get("emitted"))
-            .and_then(|value| value.as_bool()),
-        Some(true),
-        "TriggerWorkspaceSync should report an emitted update. Got: {result}"
-    );
-
+    let dirty = result
+        .get("dirty_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     assert!(
-        result
-            .get("data")
-            .and_then(|value| value.get("data"))
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| !value.is_empty()),
-        "TriggerWorkspaceSync should return a non-empty workspace update payload. Got: {result}"
+        dirty > 0,
+        "After file events, dirty_count should be > 0. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn file_deleted_event_records_pending_delete() {
+    require_wasm!();
+    let storage = Arc::new(RecordingStorage::new());
+    let emitter = Arc::new(RecordingEventEmitter::new());
+    let harness = load_with_storage_and_emitter(storage, emitter);
+    harness.init().await.expect("init");
+
+    // Create then delete a file
+    harness.send_file_created("docs/temp.md").await;
+    harness.send_file_deleted("docs/temp.md").await;
+
+    let result = harness
+        .command("SyncStatus", json!({}))
+        .await
+        .expect("SyncStatus should return Some")
+        .expect("SyncStatus should succeed");
+
+    let pending = result
+        .get("pending_deletes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        pending > 0,
+        "After file delete, pending_deletes should be > 0. Got: {result}"
     );
 }
 
@@ -850,77 +657,27 @@ async fn file_deleted_event_does_not_crash() {
 }
 
 #[tokio::test]
-async fn file_deleted_event_tombstones_crdt_entry() {
+async fn file_deleted_event_creates_pending_delete_entry() {
     require_wasm!();
-    let harness = load_sync_plugin();
+    let storage = Arc::new(RecordingStorage::new());
+    let emitter = Arc::new(RecordingEventEmitter::new());
+    let harness = load_with_storage_and_emitter(storage, emitter);
     harness.init().await.expect("init");
-
-    harness
-        .command(
-            "SetCrdtFile",
-            json!({
-                "path": "docs/removed-entry.md",
-                "metadata": {
-                    "filename": "removed-entry.md",
-                    "title": "Removed Entry",
-                    "part_of": null,
-                    "contents": null,
-                    "attachments": [],
-                    "deleted": false,
-                    "audience": null,
-                    "description": "Delete me",
-                    "extra": {},
-                    "modified_at": 1
-                }
-            }),
-        )
-        .await
-        .expect("SetCrdtFile should return Some")
-        .expect("SetCrdtFile should succeed");
 
     harness.send_file_deleted("docs/removed-entry.md").await;
 
-    let active = harness
-        .command("ListCrdtFiles", json!({}))
+    let status = harness
+        .command("SyncStatus", json!({}))
         .await
-        .expect("ListCrdtFiles should return Some")
-        .expect("ListCrdtFiles should succeed");
-    let active_files = active
-        .as_array()
-        .expect("ListCrdtFiles should return an array");
+        .expect("SyncStatus should return Some")
+        .expect("SyncStatus should succeed");
+
+    let pending = status
+        .get("pending_deletes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     assert!(
-        active_files.iter().all(|entry| {
-            entry
-                .as_array()
-                .and_then(|tuple| tuple.first())
-                .and_then(|value| value.as_str())
-                != Some("docs/removed-entry.md")
-        }),
-        "deleted file should drop out of active CRDT listings. Got: {active}"
-    );
-
-    let all_files = harness
-        .command("ListCrdtFiles", json!({ "include_deleted": true }))
-        .await
-        .expect("ListCrdtFiles should return Some")
-        .expect("ListCrdtFiles should succeed");
-    let removed = all_files
-        .as_array()
-        .expect("ListCrdtFiles should return an array")
-        .iter()
-        .find_map(|entry| {
-            let tuple = entry.as_array()?;
-            if tuple.first().and_then(|value| value.as_str()) == Some("docs/removed-entry.md") {
-                tuple.get(1)
-            } else {
-                None
-            }
-        })
-        .expect("deleted entry should remain as a tombstone");
-
-    assert_eq!(
-        removed.get("deleted").and_then(|value| value.as_bool()),
-        Some(true),
-        "deleted file should remain tombstoned. Got: {all_files}"
+        pending > 0,
+        "deleted file should create a pending delete record. Got: {status}"
     );
 }
