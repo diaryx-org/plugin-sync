@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["rt", "macros", "time"] }
 [patch.crates-io]
 diaryx_core = { git = "https://github.com/diaryx-org/diaryx.git", subdirectory = "crates/diaryx_core" }
 diaryx_extism = { git = "https://github.com/diaryx-org/diaryx.git", subdirectory = "crates/diaryx_extism" }
-diaryx_plugin_sdk = { path = "../plugin-sdk" }
+diaryx_plugin_sdk = { git = "https://github.com/diaryx-org/plugin-sdk.git" }
 getrandom = { git = "https://github.com/diaryx-org/plugin-sdk.git", subdirectory = "patches/getrandom-0.2" }
 
 [profile.release]

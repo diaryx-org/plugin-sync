@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "diaryx_core"
 version = "1.4.0"
-source = "git+https://github.com/diaryx-org/diaryx.git#800b6a5e6344c86b10547f3ad849ca2e87969efb"
+source = "git+https://github.com/diaryx-org/diaryx.git#b81fb402a4abefb819e49a541c137ad52cc452a1"
 dependencies = [
  "async-trait",
  "base64",
@@ -489,7 +489,7 @@ dependencies = [
 [[package]]
 name = "diaryx_extism"
 version = "1.4.0"
-source = "git+https://github.com/diaryx-org/diaryx.git#800b6a5e6344c86b10547f3ad849ca2e87969efb"
+source = "git+https://github.com/diaryx-org/diaryx.git#b81fb402a4abefb819e49a541c137ad52cc452a1"
 dependencies = [
  "async-trait",
  "base64",
@@ -509,6 +509,7 @@ dependencies = [
 [[package]]
 name = "diaryx_plugin_sdk"
 version = "0.3.1"
+source = "git+https://github.com/diaryx-org/plugin-sdk.git#8f82feb982a033ea0291618da06231cae498fc92"
 dependencies = [
  "base64",
  "extism-pdk",
